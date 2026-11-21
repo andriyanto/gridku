@@ -13,10 +13,9 @@
   <img src="docs/images/gridku.png" alt="GridKu dengan contoh dasbor penjualan kuartalan: tabel bergaris selang-seling dengan baris total, data bar, ikon panah dan sparkline, di samping grafik kolom dan grafik pai." width="100%">
 </p>
 
-> **Status:** belum ada rilis bernama GridKu. Rilis yang sudah ada di halaman
-> [Releases](https://github.com/andriyanto/gridku/releases) masih bernama GridCraft. Installer
-> GridKu akan muncul di sana setelah rilis GridKu pertama. Sampai saat itu, GridKu bisa dibangun
-> dari kode sumber (lihat [Membangun dari kode sumber](#membangun-dari-kode-sumber)).
+> **Rilis pertama bernama GridKu adalah v1.1.0.** Rilis v1.0.0 di halaman
+> [Releases](https://github.com/andriyanto/gridku/releases) masih bernama GridCraft; GridKu
+> terpasang sebagai aplikasi baru di sampingnya.
 
 ## Apa yang bisa dilakukan
 
@@ -60,7 +59,7 @@ dari aplikasi.
 
 ## Unduhan dan pemasangan
 
-Setelah rilis GridKu pertama terbit, semua berkasnya ada di
+Semua berkasnya ada di
 [rilis terbaru](https://github.com/andriyanto/gridku/releases/latest). `<ver>` adalah nomor
 versi, dan `SHA256SUMS.txt` memuat checksum setiap berkas.
 
