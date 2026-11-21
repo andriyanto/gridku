@@ -1976,7 +1976,7 @@ dependencies = [
 
 [[package]]
 name = "gridcraft"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "arboard",
  "craft-print",
@@ -2003,7 +2003,7 @@ dependencies = [
 
 [[package]]
 name = "gridcraft-calc"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "gridcraft-core",
  "gridcraft-formula",
@@ -2015,7 +2015,7 @@ dependencies = [
 
 [[package]]
 name = "gridcraft-chart"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "gridcraft-calc",
  "gridcraft-core",
@@ -2026,7 +2026,7 @@ dependencies = [
 
 [[package]]
 name = "gridcraft-cli"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "gridcraft-engine",
  "gridcraft-mcp",
@@ -2039,7 +2039,7 @@ dependencies = [
 
 [[package]]
 name = "gridcraft-core"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "jiff",
  "js-sys",
@@ -2050,7 +2050,7 @@ dependencies = [
 
 [[package]]
 name = "gridcraft-engine"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "gridcraft-calc",
  "gridcraft-chart",
@@ -2073,7 +2073,7 @@ dependencies = [
 
 [[package]]
 name = "gridcraft-formula"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "gridcraft-core",
  "serde",
@@ -2082,7 +2082,7 @@ dependencies = [
 
 [[package]]
 name = "gridcraft-functions"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "gridcraft-core",
  "regex",
@@ -2090,7 +2090,7 @@ dependencies = [
 
 [[package]]
 name = "gridcraft-math"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "ratex-font",
  "ratex-layout",
@@ -2100,7 +2100,7 @@ dependencies = [
 
 [[package]]
 name = "gridcraft-mcp"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "gridcraft-engine",
  "log",
@@ -2109,7 +2109,7 @@ dependencies = [
 
 [[package]]
 name = "gridcraft-model"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "gridcraft-core",
  "gridcraft-formula",
@@ -2122,18 +2122,18 @@ dependencies = [
 
 [[package]]
 name = "gridcraft-numfmt"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "gridcraft-core",
 ]
 
 [[package]]
 name = "gridcraft-pdf"
-version = "1.0.0"
+version = "1.1.0"
 
 [[package]]
 name = "gridcraft-sandbox"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "landlock",
  "libc",
@@ -2144,7 +2144,7 @@ dependencies = [
 
 [[package]]
 name = "gridcraft-ui-egui"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "craft-ui",
  "craft-window",
@@ -2171,7 +2171,7 @@ dependencies = [
 
 [[package]]
 name = "gridcraft-update"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "dunce",
  "egui",
@@ -2196,7 +2196,7 @@ dependencies = [
 
 [[package]]
 name = "gridcraft-web"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "craft-web-api",
  "craft-web-host",
@@ -2215,7 +2215,7 @@ dependencies = [
 
 [[package]]
 name = "gridcraft-xlsx"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "aes",
  "gridcraft-core",
@@ -6721,7 +6721,7 @@ checksum = "e450f9b2ed1dff33c94c12589a87338689467b9c4f5d8a5710bd09a847d2c8a7"
 
 [[package]]
 name = "xtask"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "gridcraft-engine",
  "serde_json",
