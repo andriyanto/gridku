@@ -6526,3 +6526,38 @@ fn pivot_new_sheet_destination_respects_workbook_structure_protection() {
     }
     assert!(s.execute("insert.pivotTable", json!({"source": "A1:B3", "location": "New"})).is_err());
 }
+
+/// Like Excel, `+` (or `-`) starting a calculation enters a formula, as `=` does: `+5+6` shows
+/// 11 and the formula bar `=+5+6`. A plain signed number stays a number, and text that only
+/// starts with a sign (a phone number with spaces, an unfinished sum) stays text.
+#[test]
+fn a_leading_plus_or_minus_starts_a_calculation() {
+    let mut s = s();
+    let cases: [(&str, Value, Option<&str>); 10] = [
+        ("+5+6", Value::Number(11.0), Some("=+5+6")),
+        ("-5+6", Value::Number(1.0), Some("=-5+6")),
+        ("+10/4", Value::Number(2.5), Some("=+10/4")),
+        ("+2*(3+4)", Value::Number(14.0), Some("=+2*(3+4)")),
+        ("+5 + 6", Value::Number(11.0), Some("=+5+6")),
+        ("+.5+1", Value::Number(1.5), Some("=+0.5+1")),
+        ("+5", Value::Number(5.0), None),
+        ("-5", Value::Number(-5.0), None),
+        ("+62 812 3456", Value::text("+62 812 3456"), None),
+        ("+5+", Value::text("+5+"), None),
+    ];
+    for (i, (input, value, formula)) in cases.into_iter().enumerate() {
+        let cell = format!("A{}", i + 1);
+        s.execute("cell.set", json!({"cell": cell, "input": input})).unwrap();
+        assert_eq!(v(&s, &cell), value, "{input}");
+        let got = s.execute("cell.get", json!({"cell": cell})).unwrap();
+        assert_eq!(got["formula"].as_str(), formula, "{input}: {got}");
+    }
+    // As before: a sign before a name or a parenthesis.
+    s.execute("cell.set", json!({"cell": "B1", "input": "+SUM(1,2)"})).unwrap();
+    assert_eq!(v(&s, "B1"), Value::Number(3.0));
+    // A cell formatted as text keeps what was typed.
+    s.execute("home.numberFormat", json!({"range": "C1", "code": "@"})).unwrap();
+    s.execute("cell.set", json!({"cell": "C1", "input": "+5+6"})).unwrap();
+    assert_eq!(v(&s, "C1"), Value::text("+5+6"));
+    assert!(s.execute("cell.get", json!({"cell": "C1"})).unwrap()["formula"].is_null());
+}
