@@ -52,6 +52,13 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg"]
 # Reading SQLite databases (Data › DB Connect). MIT; SQLite itself is public domain and built in
 # from source (`bundled`), so no system library is needed. Desktop only (not wasm32).
 rusqlite = { version = "0.43", default-features = false, features = ["bundled", "hooks"] }
+# Reading PostgreSQL (Data › DB Connect): the synchronous client (MIT OR Apache-2.0) over TLS with
+# rustls and ring (Apache-2.0, ISC, MIT); server certificates checked against the system's roots
+# (rustls-native-certs). Desktop only.
+postgres = { version = "0.19", default-features = false }
+tokio-postgres-rustls = { version = "0.14", default-features = false, features = ["ring", "native-certs"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-native-certs = "0.8"
 
 # equations: RaTeX (MIT) lays LaTeX out as positioned glyphs, rules and paths. Exact pins: it is
 # young (0.1.x), and the gate recorded in docs/decisions.md vetted this release.

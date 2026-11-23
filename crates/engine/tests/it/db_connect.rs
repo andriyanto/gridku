@@ -217,3 +217,46 @@ fn the_source_is_saved_in_the_file_relative_to_it_and_refreshes_after_opening() 
     assert_eq!(items, 1);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// PostgreSQL, against a real server when `GRIDKU_TEST_PG` names one (`host:port:user:password`)
+/// with the database `toko` of `docs/databases.md`'s test script; skipped otherwise. The
+/// password is given for each call and never kept: not in the source, not in the saved file.
+#[test]
+fn postgresql_tables_load_and_refresh_with_the_password_each_time() {
+    let Ok(v) = std::env::var("GRIDKU_TEST_PG") else { return };
+    let parts: Vec<&str> = v.splitn(4, ':').collect();
+    let [host, port, user, password] = parts[..] else { panic!("GRIDKU_TEST_PG: host:port:user:password") };
+    let conn = json!({"engine": "postgresql", "host": host, "port": port, "database": "toko", "user": user, "password": password});
+    let with = |extra: Json| {
+        let mut p = conn.clone();
+        for (k, v) in extra.as_object().unwrap() {
+            p[k] = v.clone();
+        }
+        p
+    };
+    let mut s = Session::new();
+    s.new_workbook();
+    let t = run(&mut s, "data.dbTables", conn.clone());
+    assert_eq!(t["tables"][0], json!({"schema": "gudang", "name": "stok", "kind": "table"}));
+    let c = run(&mut s, "data.dbColumns", with(json!({"table": "pelanggan"})));
+    assert_eq!(c["columns"][1], json!({"name": "nama", "type": "character varying", "length": "60", "nullable": false, "primaryKey": 0}));
+    let r = run(&mut s, "data.dbLoad", with(json!({"schema": "gudang", "table": "stok"})));
+    assert_eq!((r["sheet"].as_str(), r["rows"].as_u64()), (Some("gudang.stok"), Some(2500)));
+    let r = run(&mut s, "data.dbLoad", with(json!({"table": "pelanggan"})));
+    assert_eq!(r["sheet"], "pelanggan", "public's tables are named alone");
+    assert_eq!(cell(&s, "pelanggan", "C2"), Value::Number(1234.5));
+    assert_eq!(cell(&s, "pelanggan", "D2"), Value::Bool(true));
+    assert!(matches!(cell(&s, "pelanggan", "E2"), Value::Number(_)), "a date");
+    assert_eq!(cell(&s, "pelanggan", "G2"), Value::text("9007199254740993"));
+    assert_eq!(cell(&s, "pelanggan", "H2"), Value::text("[BLOB 2 bytes]"));
+    let src = s.doc().unwrap().wb.db_sources.iter().find(|x| x.table == "pelanggan").cloned().unwrap();
+    assert_eq!(src.location, format!("postgresql://{user}@{host}:{port}/toko?sslmode=prefer"));
+    assert!(!src.location.contains(password));
+    // Refresh asks for the password again.
+    run(&mut s, "selection.set", json!({"range": "A2"}));
+    assert!(s.execute("data.dbRefresh", json!({})).is_err(), "without the password");
+    let r = run(&mut s, "data.dbRefresh", json!({"password": password}));
+    assert_eq!(r["refreshed"], true);
+    let bytes = gridcraft_xlsx::write_xlsx(&s.doc().unwrap().wb).unwrap();
+    assert!(!String::from_utf8_lossy(&zip_text(&bytes, "customXml/item1.xml").into_bytes()).contains(password));
+}

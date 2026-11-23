@@ -1,5 +1,7 @@
 //! Data › DB Connect: a database's tables and views, their columns, and loading one into a sheet
-//! as a table, which Refresh reads again (`docs/databases.md`).
+//! as a table, which Refresh reads again (`docs/databases.md`). A database is a SQLite file
+//! (`path`) or a PostgreSQL server (`host`, `port`, `database`, `user`, `password`, `ssl`); a
+//! PostgreSQL password is a parameter of each call and is never kept, here or in the journal.
 //!
 //! Loading reads the database table first, then, as one Undo step, puts it in a new sheet named
 //! after it (made a valid, unused sheet name) as a table with a header row. Loading the same
@@ -22,7 +24,7 @@
 use std::sync::Arc;
 
 use gridcraft_core::{CellRef, RangeRef, Value};
-use gridcraft_db::{ColumnInfo, DbError, DbValue, Limits, RowKey, TableData};
+use gridcraft_db::{ColumnInfo, DbError, DbValue, Limits, PgConfig, RowKey, SslMode, TableData};
 use gridcraft_model::{DbColumn, DbEngine, DbRowKey, DbSource};
 use serde_json::{Value as Json, json};
 
@@ -37,7 +39,7 @@ pub(super) fn specs() -> Vec<CommandSpec> {
             "DB Connect",
             ["Data", "Get & Transform Data"],
             None,
-            "{engine?: \"sqlite\", path} → {tables: [{name, kind: \"table\" | \"view\"}]}: the tables, then the views, of the database (opened read-only)",
+            "{engine?: \"sqlite\" | \"postgresql\", path (SQLite) | host, port?: 5432, database, user, password?, ssl?: \"disable\" | \"prefer\" | \"require\" (PostgreSQL)} → {tables: [{schema?, name, kind: \"table\" | \"view\"}]}: the tables, then the views, of the database (read-only; PostgreSQL schema by schema). The password is used for the call and never kept",
             has_doc,
             tables
         ),
@@ -46,7 +48,7 @@ pub(super) fn specs() -> Vec<CommandSpec> {
             "Table Information",
             ["Data", "Get & Transform Data"],
             None,
-            "{engine?: \"sqlite\", path, table} → {columns: [{name, type, length, nullable, primaryKey}]}: a table's or view's columns as the database declares them (primaryKey: place in the key, 0 when not in it)",
+            "{engine?: \"sqlite\" | \"postgresql\", path (SQLite) | host, port?: 5432, database, user, password?, ssl?: \"disable\" | \"prefer\" | \"require\" (PostgreSQL), schema? (PostgreSQL, default public), table} → {columns: [{name, type, length, nullable, primaryKey}]}: a table's or view's columns as the database declares them (primaryKey: place in the key, 0 when not in it)",
             has_doc,
             columns
         ),
@@ -55,7 +57,7 @@ pub(super) fn specs() -> Vec<CommandSpec> {
             "Load",
             ["Data", "Get & Transform Data"],
             None,
-            "{engine?: \"sqlite\", path, table} → {sheet, table, range, rows, columns, truncated, cutTexts, refreshed}: the database table in a new sheet named after it, as a table with a header row; a table loaded before is read again into its sheet table instead (`refreshed`)",
+            "{engine?: \"sqlite\" | \"postgresql\", path (SQLite) | host, port?: 5432, database, user, password?, ssl?: \"disable\" | \"prefer\" | \"require\" (PostgreSQL), schema?, table} → {sheet, table, range, rows, columns, truncated, cutTexts, refreshed}: the database table in a new sheet named after it, as a table with a header row; a table loaded before is read again into its sheet table instead (`refreshed`)",
             has_doc,
             load
         ),
@@ -64,7 +66,7 @@ pub(super) fn specs() -> Vec<CommandSpec> {
             "Refresh",
             ["Data", "Get & Transform Data"],
             None,
-            "{table?: a sheet table's name, else the one at the active cell} → as data.dbLoad: reads its database table again",
+            "{table?: a sheet table's name, else the one at the active cell, password? (PostgreSQL: asked again, never kept)} → as data.dbLoad: reads its database table again",
             has_doc,
             refresh
         ),
@@ -74,7 +76,7 @@ pub(super) fn specs() -> Vec<CommandSpec> {
 fn engine_param(p: &Json, id: &str) -> Result<DbEngine> {
     match str_param(p, "engine") {
         None => Ok(DbEngine::Sqlite),
-        Some(e) => DbEngine::parse(e).ok_or_else(|| bad(id, format!("unknown database engine `{e}` (known: sqlite)"))),
+        Some(e) => DbEngine::parse(e).ok_or_else(|| bad(id, format!("unknown database engine `{e}` (known: sqlite, postgresql)"))),
     }
 }
 
@@ -86,16 +88,115 @@ fn path_param(p: &Json, id: &str) -> Result<String> {
     Ok(abs)
 }
 
+/// A PostgreSQL connection from the parameters: `host`, `port`, `database`, `user`, `password`,
+/// `ssl`. A macro step or a script may not reach a server any more than a file.
+fn pg_param(p: &Json, id: &str) -> Result<PgConfig> {
+    let need =
+        |k: &str| str_param(p, k).map(str::trim).filter(|s| !s.is_empty()).map(str::to_string).ok_or_else(|| bad(id, format!("missing `{k}`")));
+    let port = match p.get("port") {
+        None | Some(Json::Null) => 5432,
+        Some(v) => v
+            .as_u64()
+            .or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
+            .and_then(|n| u16::try_from(n).ok())
+            .ok_or_else(|| bad(id, "`port` must be 1 to 65535"))?,
+    };
+    let ssl = match str_param(p, "ssl") {
+        None => SslMode::default(),
+        Some(m) => SslMode::parse(m).ok_or_else(|| bad(id, format!("`ssl` must be disable, prefer or require, not `{m}`")))?,
+    };
+    let cfg = PgConfig {
+        host: need("host")?,
+        port,
+        database: need("database")?,
+        user: need("user")?,
+        password: str_param(p, "password").unwrap_or("").to_string(),
+        ssl,
+    };
+    crate::io::check_file_access(&cfg.url())?;
+    Ok(cfg)
+}
+
+/// A database to read: a SQLite file or a PostgreSQL connection.
+enum Conn {
+    Sqlite(String),
+    Pg(PgConfig),
+}
+
+impl Conn {
+    fn from_params(p: &Json, id: &str) -> Result<Conn> {
+        Ok(match engine_param(p, id)? {
+            DbEngine::Sqlite => Conn::Sqlite(path_param(p, id)?),
+            DbEngine::Postgres => Conn::Pg(pg_param(p, id)?),
+        })
+    }
+
+    /// The database a loaded table came from; a PostgreSQL one takes `p.password`.
+    fn of_source(src: &DbSource, p: &Json, id: &str) -> Result<Conn> {
+        Ok(match src.engine {
+            DbEngine::Sqlite => Conn::Sqlite(src.location.clone()),
+            DbEngine::Postgres => {
+                let mut cfg = PgConfig::from_url(&src.location).ok_or_else(|| bad(id, "the table's database connection can't be read"))?;
+                cfg.password = str_param(p, "password").unwrap_or("").to_string();
+                Conn::Pg(cfg)
+            }
+        })
+    }
+
+    fn engine(&self) -> DbEngine {
+        match self {
+            Conn::Sqlite(_) => DbEngine::Sqlite,
+            Conn::Pg(_) => DbEngine::Postgres,
+        }
+    }
+
+    /// Where the database is, as a source keeps it (never a password).
+    fn location(&self) -> String {
+        match self {
+            Conn::Sqlite(path) => path.clone(),
+            Conn::Pg(cfg) => cfg.url(),
+        }
+    }
+
+    /// The schema a table is in: PostgreSQL's (`public` unless named), none for SQLite.
+    fn schema(&self, p: &Json) -> Option<String> {
+        match self {
+            Conn::Sqlite(_) => None,
+            Conn::Pg(_) => Some(str_param(p, "schema").map(str::trim).filter(|s| !s.is_empty()).unwrap_or("public").to_string()),
+        }
+    }
+
+    fn objects(&self) -> std::result::Result<Vec<gridcraft_db::ObjectInfo>, DbError> {
+        match self {
+            Conn::Sqlite(path) => gridcraft_db::sqlite_objects(path),
+            Conn::Pg(cfg) => gridcraft_db::pg_objects(cfg),
+        }
+    }
+
+    fn columns(&self, schema: Option<&str>, table: &str) -> std::result::Result<Vec<ColumnInfo>, DbError> {
+        match self {
+            Conn::Sqlite(path) => gridcraft_db::sqlite_columns(path, table),
+            Conn::Pg(cfg) => gridcraft_db::pg_columns(cfg, schema.unwrap_or("public"), table),
+        }
+    }
+}
+
 fn db_err(e: DbError) -> EngineError {
     EngineError::Other(e.to_string())
 }
 
 fn tables(_: &mut Session, p: &Json) -> Result<Json> {
     const ID: &str = "data.dbTables";
-    let DbEngine::Sqlite = engine_param(p, ID)?;
-    let path = path_param(p, ID)?;
-    let found = gridcraft_db::sqlite_objects(&path).map_err(db_err)?;
-    Ok(json!({"tables": found.iter().map(|o| json!({"name": o.name, "kind": o.kind.name()})).collect::<Vec<_>>()}))
+    let conn = Conn::from_params(p, ID)?;
+    let found = conn.objects().map_err(db_err)?;
+    let list = found.iter().map(|o| {
+        let mut t = json!({"name": o.name, "kind": o.kind.name()});
+        if let Some(schema) = &o.schema {
+            t["schema"] = json!(schema);
+        }
+        t
+    });
+    Ok(json!({"tables": list.collect::<Vec<_>>()}))
 }
 
 fn column_json(c: &ColumnInfo) -> Json {
@@ -104,10 +205,9 @@ fn column_json(c: &ColumnInfo) -> Json {
 
 fn columns(_: &mut Session, p: &Json) -> Result<Json> {
     const ID: &str = "data.dbColumns";
-    let DbEngine::Sqlite = engine_param(p, ID)?;
-    let path = path_param(p, ID)?;
+    let conn = Conn::from_params(p, ID)?;
     let table = str_param(p, "table").ok_or_else(|| bad(ID, "missing `table`"))?;
-    let cols = gridcraft_db::sqlite_columns(&path, table).map_err(db_err)?;
+    let cols = conn.columns(conn.schema(p).as_deref(), table).map_err(db_err)?;
     Ok(json!({"columns": cols.iter().map(column_json).collect::<Vec<_>>()}))
 }
 
@@ -180,7 +280,7 @@ fn grid(data: &TableData, sys: gridcraft_core::DateSystem) -> Grid {
     Grid { rows, formats }
 }
 
-fn source(engine: DbEngine, location: &str, table: &str, table_id: u32, data: &TableData) -> DbSource {
+fn source(conn: &Conn, schema: Option<String>, table: &str, table_id: u32, data: &TableData) -> DbSource {
     let columns = data
         .columns
         .iter()
@@ -197,7 +297,7 @@ fn source(engine: DbEngine, location: &str, table: &str, table_id: u32, data: &T
         RowKey::Rowid => DbRowKey::Rowid(data.rowids.clone()),
         RowKey::None => DbRowKey::None,
     };
-    DbSource { engine, location: location.to_string(), schema: None, table: table.to_string(), table_id, columns, key }
+    DbSource { engine: conn.engine(), location: conn.location(), schema, table: table.to_string(), table_id, columns, key }
 }
 
 /// The sheet table with id `id`: its sheet, name and range.
@@ -259,13 +359,16 @@ fn write(s: &mut Session, si: usize, start: CellRef, g: &Grid, clear: Option<Ran
     Ok(())
 }
 
-fn read(s: &Session, path: &str, table: &str) -> Result<TableData> {
+fn read(s: &Session, conn: &Conn, schema: Option<&str>, table: &str) -> Result<TableData> {
     // Cancel (the busy box, Esc) stops the read; the rows read show as they come.
     let interrupt = s.interrupt();
     let stop: gridcraft_db::Stop = Arc::new(move || interrupt.is_requested());
     let progress = s.progress();
     let mut report = |done: usize, total: usize| progress.report(Phase::ReadingRows, done as u64, total as u64);
-    let data = gridcraft_db::sqlite_read(path, table, Limits::default(), Some(stop), &mut report);
+    let data = match conn {
+        Conn::Sqlite(path) => gridcraft_db::sqlite_read(path, table, Limits::default(), Some(stop), &mut report),
+        Conn::Pg(cfg) => gridcraft_db::pg_read(cfg, schema.unwrap_or("public"), table, Limits::default(), Some(stop), &mut report),
+    };
     s.progress().clear();
     data.map_err(|e| match e {
         DbError::Cancelled => EngineError::Cancelled,
@@ -291,26 +394,31 @@ fn result(data: &TableData, sheet: &str, table: &str, range: RangeRef, refreshed
 
 fn load(s: &mut Session, p: &Json) -> Result<Json> {
     const ID: &str = "data.dbLoad";
-    let engine = engine_param(p, ID)?;
-    let path = path_param(p, ID)?;
+    let conn = Conn::from_params(p, ID)?;
+    let schema = conn.schema(p);
     let table = str_param(p, "table").ok_or_else(|| bad(ID, "missing `table`"))?.to_string();
     // Loaded before, and its sheet table is still there: read it again into that table.
+    let (engine, location) = (conn.engine(), conn.location());
     let wb = &s.doc()?.wb;
-    let before = wb
-        .db_sources
-        .iter()
-        .find(|src| src.engine == engine && src.location == path && src.table == table && table_by_id(wb, src.table_id).is_some());
+    let before = wb.db_sources.iter().find(|src| {
+        src.engine == engine && src.location == location && src.schema == schema && src.table == table && table_by_id(wb, src.table_id).is_some()
+    });
     if let Some(id) = before.map(|src| src.table_id) {
-        return refresh_table(s, id, ID);
+        return refresh_table(s, id, &conn, ID);
     }
-    let data = read(s, &path, &table)?;
+    let data = read(s, &conn, schema.as_deref(), &table)?;
     if data.columns.is_empty() {
         return Err(bad(ID, format!("\"{table}\" has no columns to load")));
     }
     let sys = s.doc()?.wb.date_system;
     let g = grid(&data, sys);
     s.grouped("Load from Database", |s| {
-        let name = sheet_name(&s.doc()?.wb, &table);
+        // A table of another schema than `public` is named with it (`gudang.stok`).
+        let shown = match schema.as_deref() {
+            Some(sch) if sch != "public" => format!("{sch}.{table}"),
+            _ => table.clone(),
+        };
+        let name = sheet_name(&s.doc()?.wb, &shown);
         let count = s.doc()?.wb.sheets.len();
         s.execute("home.insertSheet", json!({"name": name, "before": count}))?;
         let si = s.doc()?.wb.sheet_index(&name).ok_or_else(|| bad(ID, "the new sheet is gone"))?;
@@ -324,7 +432,7 @@ fn load(s: &mut Session, p: &Json) -> Result<Json> {
         let tname = made.get("table").and_then(Json::as_str).unwrap_or_default().to_string();
         let wb = &s.doc()?.wb;
         let id = wb.sheet(si).and_then(|sh| sh.tables.iter().find(|t| t.name == tname)).map(|t| t.id).ok_or_else(|| bad(ID, "the table is gone"))?;
-        let src = Arc::new(source(engine, &path, &table, id, &data));
+        let src = Arc::new(source(&conn, schema.clone(), &table, id, &data));
         edit(s, |cx| {
             cx.wb.db_sources.retain(|o| o.table_id != id);
             cx.wb.db_sources.push(src);
@@ -350,18 +458,17 @@ fn refresh(s: &mut Session, p: &Json) -> Result<Json> {
         }),
     };
     let id = t.map(|t| t.id).ok_or_else(|| bad(ID, "select a cell in a table loaded from a database"))?;
-    if !wb.db_sources.iter().any(|src| src.table_id == id) {
-        return Err(bad(ID, "this table wasn't loaded from a database"));
-    }
-    refresh_table(s, id, ID)
+    let src = wb.db_sources.iter().find(|src| src.table_id == id).cloned().ok_or_else(|| bad(ID, "this table wasn't loaded from a database"))?;
+    let conn = Conn::of_source(&src, p, ID)?;
+    refresh_table(s, id, &conn, ID)
 }
 
-/// Reads the database table of sheet table `id` again into it.
-fn refresh_table(s: &mut Session, id: u32, cmd: &str) -> Result<Json> {
+/// Reads the database table of sheet table `id` again into it, from `conn`.
+fn refresh_table(s: &mut Session, id: u32, conn: &Conn, cmd: &str) -> Result<Json> {
     let wb = &s.doc()?.wb;
     let src = wb.db_sources.iter().find(|src| src.table_id == id).cloned().ok_or_else(|| bad(cmd, "this table wasn't loaded from a database"))?;
     let (si, tname, old) = table_by_id(wb, id).ok_or_else(|| bad(cmd, "the table loaded from the database is gone"))?;
-    let data = read(s, &src.location, &src.table)?;
+    let data = read(s, conn, src.schema.as_deref(), &src.table)?;
     if data.columns.is_empty() {
         return Err(bad(cmd, format!("\"{}\" has no columns to load", src.table)));
     }
@@ -386,7 +493,7 @@ fn refresh_table(s: &mut Session, id: u32, cmd: &str) -> Result<Json> {
         if new != old {
             s.execute("table.resize", json!({"table": tname, "range": new.a1()}))?;
         }
-        let fresh = Arc::new(source(src.engine, &src.location, &src.table, id, &data));
+        let fresh = Arc::new(source(conn, src.schema.clone(), &src.table, id, &data));
         edit(s, |cx| {
             for o in cx.wb.db_sources.iter_mut().filter(|o| o.table_id == id) {
                 *o = fresh.clone();
