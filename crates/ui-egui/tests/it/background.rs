@@ -437,3 +437,24 @@ fn keys_wait_in_a_window_whose_input_the_raw_hook_does_not_see() {
     assert_eq!(cell(h.state(), "A1"), "Number(5.0)");
     assert!(h.state().editor.is_none());
 }
+
+/// A command that says how far it has got (loading a database table) shows it in the busy box:
+/// what it is doing and a bar with the count; the box goes when it is over.
+#[test]
+fn the_busy_box_shows_a_commands_progress() {
+    let (mut h, hold) = held();
+    let progress = h.state().session.progress();
+    h.state_mut().run_or_alert("data.dbLoad", json!({"path": "/no/such/database.db", "table": "orders"}));
+    assert!(h.state().is_busy());
+    h.run_steps(2);
+    assert!(shows(&h, "Calculating…"), "nothing reported yet: the spinner alone");
+    progress.report(gridcraft_engine::progress::Phase::ReadingRows, 500, 1000);
+    h.run_steps(2);
+    assert!(shows(&h, "Reading rows…"));
+    assert!(h.query_by_label_contains("500 / 1,000").is_some(), "the bar says how many");
+    hold.store(false, Ordering::Relaxed);
+    until_idle(&mut h);
+    h.run_steps(2);
+    assert!(!shows(&h, "Reading rows…"));
+    assert_eq!(h.state().session.progress().get(), None, "nothing left to show");
+}

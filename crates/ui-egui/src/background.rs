@@ -26,6 +26,7 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError, channel}
 use std::time::Duration;
 
 use gridcraft_engine::calc::Interrupt;
+use gridcraft_engine::progress::Progress;
 use gridcraft_engine::{EngineError, Mode, Session, find_command};
 use serde_json::Value as Json;
 
@@ -74,12 +75,17 @@ pub(crate) enum After {
     /// A cell entry: on success move the selection as the key that entered it asks, on failure
     /// open the draft again.
     Edit { draft: Box<editor::EditState>, dr: i64, dc: i64 },
+    /// As [`After::Alert`], and on success a notice with what the command returned, in the
+    /// words this gives (loading a database table: how many rows).
+    Report(fn(&Json) -> String),
 }
 
 /// A command the worker is running.
 pub(crate) struct Busy {
     done: Receiver<Done>,
     stop: Arc<Interrupt>,
+    /// How far it has got, when it says (loading a database table).
+    progress: Arc<Progress>,
     /// When it was started ([`monotonic_ms`]).
     since: f64,
     /// Cancel was asked for.
@@ -121,6 +127,7 @@ pub(crate) enum Launch {
 pub(crate) struct Pending {
     done: Receiver<Done>,
     stop: Arc<Interrupt>,
+    progress: Arc<Progress>,
     mode: Mode,
     copied: bool,
     painting: bool,
@@ -201,6 +208,7 @@ impl SheetApp {
         }
         let Some(jobs) = self.background_state.worker.clone() else { return Launch::Done(self.session.run(id, params)) };
         let stop = self.session.interrupt();
+        let progress = self.session.progress();
         let (mode, copied, painting) = (self.session.mode, self.session.clipboard.is_some(), self.session.format_painter.is_some());
         let session = std::mem::replace(&mut self.session, stand_in);
         let (reply, done) = channel();
@@ -217,16 +225,17 @@ impl SheetApp {
                 self.session = back.session;
                 Launch::Done(back.result)
             }
-            Err(RecvTimeoutError::Timeout) => Launch::Pending(Pending { done, stop, mode, copied, painting }),
+            Err(RecvTimeoutError::Timeout) => Launch::Pending(Pending { done, stop, progress, mode, copied, painting }),
             Err(RecvTimeoutError::Disconnected) => Launch::Done(Err(self.session_lost(stop))),
         }
     }
 
     /// The app is busy with command `id` from here on.
     pub(crate) fn wait_in_background(&mut self, id: &str, window: Option<u64>, pending: Pending, after: After) {
-        let Pending { done, stop, mode, copied, painting } = pending;
+        let Pending { done, stop, progress, mode, copied, painting } = pending;
         let since = monotonic_ms();
-        self.background_state.busy = Some(Busy { done, stop, since, cancelling: false, id: id.to_string(), window, mode, copied, painting, after });
+        self.background_state.busy =
+            Some(Busy { done, stop, progress, since, cancelling: false, id: id.to_string(), window, mode, copied, painting, after });
     }
 
     /// The worker went away with the session. The stand-in is what is left of it: the workbooks
@@ -328,6 +337,14 @@ impl SheetApp {
         }
         let stopped = back.result.as_ref().is_err_and(|e| *e == EngineError::Cancelled.to_string());
         match busy.after {
+            After::Report(words) => {
+                let r = self.after_command(&busy.id, busy.window, back.result);
+                match r {
+                    Ok(r) => self.toast = Some((words(&r), now_ms())),
+                    Err(_) if stopped => {}
+                    Err(e) => self.alert(e),
+                }
+            }
             After::Alert => {
                 let r = self.after_command(&busy.id, busy.window, back.result);
                 self.note_copy(&busy.id, &r);
@@ -440,8 +457,14 @@ pub(crate) fn overlay(app: &mut SheetApp, ctx: &egui::Context) {
     let title = app.ui.language.tr(if cancelling { "Cancelling…" } else { "Calculating…" }).to_owned();
     let cancel_label = app.ui.language.tr("Cancel").to_owned();
     let mut cancel = false;
+    // A command that says how far it has got shows it: what it is doing, and a bar.
+    let progress = if cancelling { None } else { busy.progress.get() };
+    let title = match progress {
+        Some((phase, ..)) => format!("{}…", app.ui.language.tr(phase.label())),
+        None => title,
+    };
     egui::Modal::new(egui::Id::unique("background_command")).show(ctx, |ui| {
-        ui.set_width(260.0);
+        ui.set_width(if progress.is_some() { 340.0 } else { 260.0 });
         ui.horizontal(|ui| {
             ui.spinner();
             ui.label(egui::RichText::new(title).strong());
@@ -449,6 +472,15 @@ pub(crate) fn overlay(app: &mut SheetApp, ctx: &egui::Context) {
                 ui.label(format!("{seconds:.0} s"));
             }
         });
+        if let Some((_, done, total)) = progress {
+            ui.add_space(6.0);
+            let fraction = if total > 0 { (done as f32 / total as f32).clamp(0.0, 1.0) } else { 0.0 };
+            let text =
+                if total > 0 { format!("{} / {} ({:.0}%)", group_digits(done), group_digits(total), fraction * 100.0) } else { group_digits(done) };
+            ui.label(text);
+            ui.add_space(4.0);
+            progress_bar(ui, (total > 0).then_some(fraction));
+        }
         ui.add_space(8.0);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if ui.add_enabled(!cancelling, egui::Button::new(cancel_label)).clicked() {
@@ -459,6 +491,78 @@ pub(crate) fn overlay(app: &mut SheetApp, ctx: &egui::Context) {
     if cancel {
         app.cancel_background();
     }
-    // The seconds, and the spinner.
-    ctx.request_repaint_after(Duration::from_millis(100));
+    // The seconds, the spinner and the bar's sweep.
+    ctx.request_repaint_after(Duration::from_millis(if progress.is_some() { 33 } else { 100 }));
+}
+
+/// The busy box's bar, as wide as the box: the part done filled in the accent colour, with a
+/// lighter band sweeping across it so that it is seen to be alive between two counts; without a
+/// total (`None`) a segment runs back and forth.
+fn progress_bar(ui: &mut egui::Ui, fraction: Option<f32>) {
+    let t = crate::theme::Tokens::get(ui.ctx());
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 10.0), egui::Sense::hover());
+    let p = ui.painter();
+    let round = egui::CornerRadius::same(5);
+    p.rect_filled(rect, round, t.separator);
+    // The time drives the sweep (seconds, wrapping every 1.6 s).
+    let phase = ((ui.input(|i| i.time) % 1.6) / 1.6) as f32;
+    let filled = match fraction {
+        Some(f) => egui::Rect::from_min_size(rect.min, egui::vec2(rect.width() * f.clamp(0.0, 1.0), rect.height())),
+        None => {
+            let w = rect.width() * 0.3;
+            let x = rect.left() + (rect.width() - w) * (1.0 - (phase * 2.0 - 1.0).abs());
+            egui::Rect::from_min_size(egui::pos2(x, rect.top()), egui::vec2(w, rect.height()))
+        }
+    };
+    if filled.width() <= 0.5 {
+        return;
+    }
+    p.rect_filled(filled, round, t.accent);
+    if fraction.is_some() {
+        // A light band crossing the filled part, from left to right.
+        let band = (filled.width() * 0.35).clamp(12.0, 80.0);
+        let x = filled.left() - band + (filled.width() + band) * phase;
+        let shine =
+            egui::Rect::from_min_max(egui::pos2(x.max(filled.left()), filled.top()), egui::pos2((x + band).min(filled.right()), filled.bottom()));
+        if shine.width() > 0.5 {
+            let clear = egui::Color32::from_white_alpha(0);
+            let light = egui::Color32::from_white_alpha(90);
+            let mut mesh = egui::Mesh::default();
+            let mid = shine.center().x;
+            for (a, b, ca, cb) in [(shine.left(), mid, clear, light), (mid, shine.right(), light, clear)] {
+                let base = mesh.vertices.len() as u32;
+                mesh.colored_vertex(egui::pos2(a, shine.top()), ca);
+                mesh.colored_vertex(egui::pos2(b, shine.top()), cb);
+                mesh.colored_vertex(egui::pos2(b, shine.bottom()), cb);
+                mesh.colored_vertex(egui::pos2(a, shine.bottom()), ca);
+                mesh.add_triangle(base, base + 1, base + 2);
+                mesh.add_triangle(base, base + 2, base + 3);
+            }
+            p.with_clip_rect(filled.shrink2(egui::vec2(0.0, 0.5))).add(mesh);
+        }
+    }
+}
+
+/// A count with its thousands grouped (`1,048,575`), for the progress bar.
+fn group_digits(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+#[cfg(test)]
+mod progress_tests {
+    #[test]
+    fn counts_are_grouped_by_thousands() {
+        assert_eq!(super::group_digits(0), "0");
+        assert_eq!(super::group_digits(999), "999");
+        assert_eq!(super::group_digits(1000), "1,000");
+        assert_eq!(super::group_digits(1_048_575), "1,048,575");
+    }
 }

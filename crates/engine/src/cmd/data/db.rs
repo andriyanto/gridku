@@ -14,6 +14,10 @@
 //! FALSE and TRUE; text in a column declared as a date or time is a date when it reads as one
 //! (`2026-01-31`, `2026-01-31 10:20:00`, `2026-01-31T10:20:00Z`), with the date format; a BLOB
 //! shows its size.
+//!
+//! A long load says how far it has got ([`crate::Session::progress`]): the rows read, then the
+//! rows written; the interface shows it with a progress bar while the command runs in the
+//! background. Cancel stops it in either phase, and nothing changes.
 
 use std::sync::Arc;
 
@@ -23,6 +27,7 @@ use gridcraft_model::{DbColumn, DbEngine, DbRowKey, DbSource};
 use serde_json::{Value as Json, json};
 
 use crate::cmd::{CommandSpec, bad, cmd, edit, has_doc, str_param};
+use crate::progress::Phase;
 use crate::{EngineError, Result, Session};
 
 pub(super) fn specs() -> Vec<CommandSpec> {
@@ -214,7 +219,10 @@ fn range_for(start: CellRef, rows: usize, cols: usize, id: &str) -> Result<Range
 /// Writes `g` from `start`, emptying first the cells of `clear` (the table's old range), and gives
 /// each date column its format.
 fn write(s: &mut Session, si: usize, start: CellRef, g: &Grid, clear: Option<RangeRef>) -> Result<()> {
-    edit(s, |cx| {
+    let interrupt = s.interrupt();
+    let progress = s.progress();
+    let total = g.rows.len() as u64;
+    let written = edit(s, |cx| {
         let sh = cx.sheet_mut(si)?;
         if let Some(old) = clear {
             let filled: Vec<CellRef> = sh.cells.iter_range(old).map(|(c, _)| c).collect();
@@ -223,6 +231,12 @@ fn write(s: &mut Session, si: usize, start: CellRef, g: &Grid, clear: Option<Ran
             }
         }
         for (r, row) in g.rows.iter().enumerate() {
+            if r.is_multiple_of(WRITE_REPORT_EVERY) {
+                if interrupt.is_requested() {
+                    return Err(EngineError::Cancelled);
+                }
+                progress.report(Phase::WritingRows, r as u64, total);
+            }
             for (c, v) in row.iter().enumerate() {
                 if !v.is_empty() {
                     sh.set_value(CellRef::new(start.row + r as u32, start.col + c as u32), v.clone());
@@ -231,7 +245,9 @@ fn write(s: &mut Session, si: usize, start: CellRef, g: &Grid, clear: Option<Ran
         }
         cx.structural = true;
         Ok(())
-    })?;
+    });
+    progress.clear();
+    written?;
     let data_rows = g.rows.len().saturating_sub(1);
     for (c, f) in g.formats.iter().enumerate() {
         if let (Some(f), true) = (f, data_rows > 0) {
@@ -243,9 +259,22 @@ fn write(s: &mut Session, si: usize, start: CellRef, g: &Grid, clear: Option<Ran
     Ok(())
 }
 
-fn read(path: &str, table: &str) -> Result<TableData> {
-    gridcraft_db::sqlite_read(path, table, Limits::default()).map_err(db_err)
+fn read(s: &Session, path: &str, table: &str) -> Result<TableData> {
+    // Cancel (the busy box, Esc) stops the read; the rows read show as they come.
+    let interrupt = s.interrupt();
+    let stop: gridcraft_db::Stop = Arc::new(move || interrupt.is_requested());
+    let progress = s.progress();
+    let mut report = |done: usize, total: usize| progress.report(Phase::ReadingRows, done as u64, total as u64);
+    let data = gridcraft_db::sqlite_read(path, table, Limits::default(), Some(stop), &mut report);
+    s.progress().clear();
+    data.map_err(|e| match e {
+        DbError::Cancelled => EngineError::Cancelled,
+        e => db_err(e),
+    })
 }
+
+/// How often (in rows) writing reports its progress and asks whether to stop.
+const WRITE_REPORT_EVERY: usize = 5000;
 
 fn result(data: &TableData, sheet: &str, table: &str, range: RangeRef, refreshed: bool) -> Json {
     json!({
@@ -274,7 +303,7 @@ fn load(s: &mut Session, p: &Json) -> Result<Json> {
     if let Some(id) = before.map(|src| src.table_id) {
         return refresh_table(s, id, ID);
     }
-    let data = read(&path, &table)?;
+    let data = read(s, &path, &table)?;
     if data.columns.is_empty() {
         return Err(bad(ID, format!("\"{table}\" has no columns to load")));
     }
@@ -332,7 +361,7 @@ fn refresh_table(s: &mut Session, id: u32, cmd: &str) -> Result<Json> {
     let wb = &s.doc()?.wb;
     let src = wb.db_sources.iter().find(|src| src.table_id == id).cloned().ok_or_else(|| bad(cmd, "this table wasn't loaded from a database"))?;
     let (si, tname, old) = table_by_id(wb, id).ok_or_else(|| bad(cmd, "the table loaded from the database is gone"))?;
-    let data = read(&src.location, &src.table)?;
+    let data = read(s, &src.location, &src.table)?;
     if data.columns.is_empty() {
         return Err(bad(cmd, format!("\"{}\" has no columns to load", src.table)));
     }
