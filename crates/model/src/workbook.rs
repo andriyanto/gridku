@@ -260,6 +260,10 @@ pub struct Workbook {
     /// ([`crate::links`]).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub links: crate::links::Links,
+    /// Tables loaded from a database, by the sheet table each is in ([`crate::db`]). Shared
+    /// between snapshots: a source can hold a key for every row loaded.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub db_sources: Vec<Arc<crate::db::DbSource>>,
     /// Macros in a newer format than this build reads, as the file held them. They are never read,
     /// listed or run; a save writes them back unchanged, so the newer build gets them back whole.
     /// Shared between snapshots, as nothing changes them.
@@ -372,6 +376,7 @@ impl Workbook {
             macros: crate::macros::Macros::default(),
             macros_read: vec![],
             links: Vec::new(),
+            db_sources: Vec::new(),
             macros_unread: Arc::default(),
             preserved: None,
             source_dir: None,

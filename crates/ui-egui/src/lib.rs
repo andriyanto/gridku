@@ -52,6 +52,7 @@ pub mod control;
 pub mod control_ui;
 mod craft_fonts_policy;
 pub mod credits;
+pub mod db_pane;
 pub mod dialogs;
 pub mod dnd;
 #[cfg(not(target_arch = "wasm32"))]

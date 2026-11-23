@@ -17,6 +17,7 @@ use super::{
 use crate::outline;
 use crate::selection::current_region;
 
+mod db;
 mod filter;
 mod grouping;
 mod links;
@@ -38,6 +39,7 @@ pub(super) use validation::{move_rule_formula, remove_validation_cells};
 
 pub fn specs() -> Vec<CommandSpec> {
     let mut specs = links::specs();
+    specs.extend(db::specs());
     specs.extend(own_specs());
     specs
 }

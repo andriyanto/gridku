@@ -38,6 +38,8 @@ pub const TABLE: &[(&str, Class)] = &[
     ("model", Class::Layer(2)),
     ("calc", Class::Layer(2)),
     ("xlsx", Class::Layer(2)),
+    // Database sources (Data › DB Connect): reads SQLite; no workspace crate below it.
+    ("db", Class::Layer(2)),
     ("chart", Class::Layer(3)),
     ("engine", Class::Layer(5)),
     ("update", Class::Layer(6)),
