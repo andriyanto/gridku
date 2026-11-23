@@ -134,6 +134,7 @@ Ranked; estimates in Opus 5.5 agent-hours. Detail and the full beta-gate list in
 
 | Date | What landed |
 |---|---|
+| 2026-11-24 | DB Connect reads PostgreSQL too (stage 2): tables and views schema by schema, Table Information, Load and Refresh, over read-only sessions with TLS; the password is asked for each time and never kept. A loaded table's source is saved in the XLSX file, and a large table loads with a progress bar and Cancel: `docs/databases.md` |
 | 2026-11-24 | Data › DB Connect reads SQLite databases (stage 1): a pane lists a file's tables and views and each table's fields, Load puts a table in a new sheet as a table, Refresh reads it again; read-only and bounded, desktop only. PostgreSQL and writing back are the next stages: `docs/databases.md` |
 | 2026-11-21 | Dependencies: zip 9.1 (closes RUSTSEC-2026-0545 and RUSTSEC-2026-0548 in zip 3); every date conversion goes through jiff instead of chrono, which was declared unmaintained (RUSTSEC-2026-0543); the update check is this repository's own copy of craft-libs' craft-update (`crates/update`). |
 | 2026-11-20 | The app is called **GridKu** (repository `andriyanto/gridku`): the programs are `gridku` and `gridku-cli`, the Windows installer puts it in `Produktivitas\GridKu` as an app of its own (new UpgradeCode), release files are `gridku-<version>-…`, and its settings and log live in a `GridKu`/`gridku` folder. A new icon by the owner, a new README, and the ArtCraft brand files are gone. Package and crate names stay `gridcraft*`. |

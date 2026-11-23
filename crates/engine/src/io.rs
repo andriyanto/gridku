@@ -547,7 +547,7 @@ pub fn save_file_bytes(wb: &Workbook, path: &str) -> Result<Vec<u8>> {
 /// together. `None` when nothing changes.
 pub(crate) fn db_relative(wb: &Workbook, folder: &std::path::Path) -> Option<Workbook> {
     let mut out: Option<Workbook> = None;
-    for (i, src) in wb.db_sources.iter().enumerate() {
+    for (i, src) in wb.db_sources.iter().enumerate().filter(|(_, s)| s.engine == gridcraft_model::DbEngine::Sqlite) {
         let file = std::path::Path::new(&src.location);
         let Some(rel) = file.is_absolute().then(|| gridcraft_xlsx::link_target(file, folder)).flatten() else { continue };
         if rel != src.location
@@ -563,7 +563,7 @@ pub(crate) fn db_relative(wb: &Workbook, folder: &std::path::Path) -> Option<Wor
 /// written relative to that folder (or as `file:///` addresses), as paths on this system.
 pub fn resolve_db_locations(wb: &mut Workbook) {
     let folder = wb.source_dir.clone();
-    for src in wb.db_sources.iter_mut() {
+    for src in wb.db_sources.iter_mut().filter(|s| s.engine == gridcraft_model::DbEngine::Sqlite) {
         let loc = &src.location;
         if std::path::Path::new(loc).is_absolute() && !loc.starts_with("file:") {
             continue;

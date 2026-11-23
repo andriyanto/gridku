@@ -136,14 +136,20 @@ pub(crate) fn build_params(d: &Dialog) -> Json {
 
 /// OK of a dialog that doesn't just run its command: Open Hyperlink asks first; Export to PDF,
 /// its options chosen, asks where to save (the save picker, or a download on the web) as the
-/// menu command does. Returns whether the dialog closes.
+/// menu command does; Database Password refreshes in the background. Returns whether the dialog
+/// closes.
 fn has_own_confirm(d: &Dialog) -> bool {
-    matches!(d.name.as_str(), "openLink" | "exportPdf")
+    matches!(d.name.as_str(), "openLink" | "exportPdf" | "dbPassword")
 }
 
 fn confirm_own(app: &mut SheetApp, d: &Dialog) -> bool {
     if d.name == "exportPdf" {
         app.run_or_alert("file.exportPdf", build_params(d));
+        return true;
+    }
+    if d.name == "dbPassword" {
+        // In the background with its progress, as the pane's Refresh.
+        crate::db_pane::run_db(app, "data.dbRefresh", build_params(d));
         return true;
     }
     confirm_open_link(app, d)

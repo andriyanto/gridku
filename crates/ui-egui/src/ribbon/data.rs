@@ -7,7 +7,7 @@ pub(super) fn data(app: &mut SheetApp, ui: &mut Ui) {
     if gd.clicked() {
         app.open_dialog("open", json!({}));
     }
-    let __k = big_button(ui, Icon::Database, "DB\nConnect", "Read the tables of a database (SQLite) into sheets", false);
+    let __k = big_button(ui, Icon::Database, "DB\nConnect", "Read the tables of a database (SQLite, PostgreSQL) into sheets", false);
     control_keytip(app, ui, &__k, "data.dbTables");
     if __k.clicked() {
         app.grid.pane = if app.grid.pane.as_deref() == Some("dbConnect") { None } else { Some("dbConnect".into()) };

@@ -929,6 +929,18 @@ impl Dialog {
             }
             "nameManager" => Dialog::custom("nameManager", "Name Manager", json!({})),
             "editLinks" => Dialog::custom("editLinks", "Edit Links", json!({})),
+            "dbPassword" => {
+                // Refresh of a table loaded from PostgreSQL: its password, asked again (never kept).
+                let url = p("url").as_str().unwrap_or("").to_string();
+                let server = gridcraft_db::PgConfig::from_url(&url).map_or(url, |c| format!("{}@{}:{}/{}", c.user, c.host, c.port, c.database));
+                Dialog::form(
+                    "dbPassword",
+                    "Database Password",
+                    "data.dbRefresh",
+                    vec![Note(format!("The password of {server}, to refresh the table")), Password { key: "password", label: "Password:" }],
+                    json!({"table": p("table")}),
+                )
+            }
             "exportPdf" => {
                 // Excel's Options… of Export › Create PDF: what to publish, and (ours) the whole
                 // workbook as one PDF or one PDF per sheet.

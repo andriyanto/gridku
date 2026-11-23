@@ -12,17 +12,23 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DbEngine {
     Sqlite,
+    Postgres,
 }
 
 impl DbEngine {
     pub fn id(self) -> &'static str {
         match self {
             DbEngine::Sqlite => "sqlite",
+            DbEngine::Postgres => "postgresql",
         }
     }
 
     pub fn parse(s: &str) -> Option<DbEngine> {
-        s.eq_ignore_ascii_case("sqlite").then_some(DbEngine::Sqlite)
+        match s.to_ascii_lowercase().as_str() {
+            "sqlite" => Some(DbEngine::Sqlite),
+            "postgresql" | "postgres" => Some(DbEngine::Postgres),
+            _ => None,
+        }
     }
 }
 
@@ -55,7 +61,8 @@ pub enum DbRowKey {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DbSource {
     pub engine: DbEngine,
-    /// Where the database is: the file's path for SQLite.
+    /// Where the database is: the file's path for SQLite; for PostgreSQL the connection as a URL
+    /// without the password (`postgresql://user@host:5432/db?sslmode=prefer`).
     pub location: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schema: Option<String>,

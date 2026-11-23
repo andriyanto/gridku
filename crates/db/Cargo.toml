@@ -3,7 +3,7 @@ name = "gridcraft-db"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "GridKu database sources: list a database's tables and columns and read a table (SQLite)"
+description = "GridKu database sources: list a database's tables and columns and read a table (SQLite, PostgreSQL)"
 
 [lints]
 workspace = true
@@ -16,3 +16,7 @@ thiserror = { workspace = true }
 # functions say the database can't be read.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 rusqlite = { workspace = true }
+postgres = { workspace = true }
+tokio-postgres-rustls = { workspace = true }
+rustls = { workspace = true }
+rustls-native-certs = { workspace = true }

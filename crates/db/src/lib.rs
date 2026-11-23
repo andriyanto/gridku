@@ -1,10 +1,13 @@
 //! GridKu's database sources (Data › DB Connect): list the tables and views of a database, the
 //! columns of one, and read one, for the engine to load into a sheet.
 //!
-//! SQLite only for now. A database file is opened read-only, never created, and nothing in it is
-//! changed: no statement is run but the catalogue queries and one `SELECT` of the table asked
-//! for. The file is hostile input: the schema it holds is not trusted (`trusted_schema=OFF`), no
-//! extension can be loaded, and a read is bounded in rows, cells, text length and time.
+//! SQLite and PostgreSQL. Nothing in a database is changed: no statement is run but the
+//! catalogue queries, a `count(*)` and one `SELECT` of the table asked for. A SQLite file is
+//! opened read-only, never created, and is hostile input: the schema it holds is not trusted
+//! (`trusted_schema=OFF`) and no extension can be loaded. A PostgreSQL session is read-only
+//! (`default_transaction_read_only`), over TLS when the server offers it (rustls, the system's
+//! certificate authorities), and its password is only ever held for the call. Every read is
+//! bounded in rows, cells, text length and time.
 //!
 //! Each column keeps its declared type, split into a type and a length (`VARCHAR(50)` is
 //! `VARCHAR` and `50`), whether it may be NULL and its place in the primary key; each table read
@@ -22,6 +25,8 @@ use std::time::Duration;
 /// Asked now and then while a read runs: `true` stops it ([`DbError::Cancelled`]).
 pub type Stop = Arc<dyn Fn() -> bool + Send + Sync>;
 
+#[cfg(not(target_arch = "wasm32"))]
+mod postgres;
 #[cfg(not(target_arch = "wasm32"))]
 mod sqlite;
 
@@ -149,6 +154,160 @@ impl Default for Limits {
     }
 }
 
+/// Whether a PostgreSQL connection uses TLS ([libpq's `sslmode`](https://www.postgresql.org/docs/current/libpq-ssl.html)
+/// names). When it does, the server's certificate is always checked against the system's
+/// certificate authorities.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SslMode {
+    /// Never.
+    Disable,
+    /// When the server offers it.
+    #[default]
+    Prefer,
+    /// Always: a server without TLS is refused.
+    Require,
+}
+
+impl SslMode {
+    pub fn id(self) -> &'static str {
+        match self {
+            SslMode::Disable => "disable",
+            SslMode::Prefer => "prefer",
+            SslMode::Require => "require",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<SslMode> {
+        match s.to_ascii_lowercase().as_str() {
+            "disable" => Some(SslMode::Disable),
+            "prefer" => Some(SslMode::Prefer),
+            "require" => Some(SslMode::Require),
+            _ => None,
+        }
+    }
+}
+
+/// Where a PostgreSQL database is, and who connects. The password is held only while a call
+/// needs it; [`PgConfig::url`] leaves it out.
+#[derive(Clone, PartialEq, Eq)]
+pub struct PgConfig {
+    pub host: String,
+    pub port: u16,
+    pub database: String,
+    pub user: String,
+    pub password: String,
+    pub ssl: SslMode,
+}
+
+impl std::fmt::Debug for PgConfig {
+    /// Without the password.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.url())
+    }
+}
+
+/// `%`-encodes what a URL's user, host or database part can't hold as it is.
+fn encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || b"-._~".contains(&b) {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+fn decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while let Some(&b) = bytes.get(i) {
+        if b == b'%'
+            && let Some(v) = bytes.get(i + 1..i + 3).and_then(|h| std::str::from_utf8(h).ok()).and_then(|h| u8::from_str_radix(h, 16).ok())
+        {
+            out.push(v);
+            i += 3;
+        } else {
+            out.push(b);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+impl PgConfig {
+    /// The connection as a URL without the password: `postgresql://user@host:5432/db?sslmode=prefer`.
+    pub fn url(&self) -> String {
+        let host = if self.host.contains(':') { format!("[{}]", self.host) } else { encode(&self.host) };
+        format!("postgresql://{}@{host}:{}/{}?sslmode={}", encode(&self.user), self.port, encode(&self.database), self.ssl.id())
+    }
+
+    /// A URL [`PgConfig::url`] wrote, with no password.
+    pub fn from_url(url: &str) -> Option<PgConfig> {
+        let rest = url.strip_prefix("postgresql://").or_else(|| url.strip_prefix("postgres://"))?;
+        let (rest, query) = rest.split_once('?').unwrap_or((rest, ""));
+        let (user, rest) = rest.split_once('@')?;
+        let (hostport, database) = rest.split_once('/')?;
+        let (host, port) = match hostport.strip_prefix('[') {
+            Some(v6) => {
+                let (h, p) = v6.split_once(']')?;
+                (h.to_string(), p.strip_prefix(':').unwrap_or(""))
+            }
+            None => {
+                let (h, p) = hostport.rsplit_once(':').unwrap_or((hostport, ""));
+                (decode(h), p)
+            }
+        };
+        let port = if port.is_empty() { 5432 } else { port.parse().ok()? };
+        let ssl = query.split('&').find_map(|kv| kv.strip_prefix("sslmode=")).and_then(SslMode::parse).unwrap_or_default();
+        Some(PgConfig { host, port, database: decode(database), user: decode(user), password: String::new(), ssl })
+    }
+}
+
+/// The tables and views of the PostgreSQL database `cfg` names, schema by schema (the system's
+/// own left out), tables first in each.
+pub fn pg_objects(cfg: &PgConfig) -> Result<Vec<ObjectInfo>, DbError> {
+    #[cfg(not(target_arch = "wasm32"))]
+    return postgres::objects(cfg);
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = cfg;
+        Err(DbError::Unavailable)
+    }
+}
+
+/// The columns of the table or view `schema.table` of the PostgreSQL database `cfg` names.
+pub fn pg_columns(cfg: &PgConfig, schema: &str, table: &str) -> Result<Vec<ColumnInfo>, DbError> {
+    #[cfg(not(target_arch = "wasm32"))]
+    return postgres::columns(cfg, schema, table);
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = (cfg, schema, table);
+        Err(DbError::Unavailable)
+    }
+}
+
+/// Reads `schema.table` of the PostgreSQL database `cfg` names, as [`sqlite_read`] reads a SQLite
+/// table. Rows are told apart by the primary key, or not at all (there is no stable row id).
+pub fn pg_read(
+    cfg: &PgConfig,
+    schema: &str,
+    table: &str,
+    limits: Limits,
+    stop: Option<Stop>,
+    progress: &mut dyn FnMut(usize, usize),
+) -> Result<TableData, DbError> {
+    #[cfg(not(target_arch = "wasm32"))]
+    return postgres::read(cfg, schema, table, limits, stop, progress);
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = (cfg, schema, table, limits, stop, progress);
+        Err(DbError::Unavailable)
+    }
+}
+
 /// The tables and views of the SQLite database at `path`, tables first, each by name.
 pub fn sqlite_objects(path: &str) -> Result<Vec<ObjectInfo>, DbError> {
     #[cfg(not(target_arch = "wasm32"))]
@@ -193,6 +352,26 @@ pub fn sqlite_read(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn postgres_urls_leave_the_password_out_and_read_back() {
+        let cfg = PgConfig {
+            host: "db.example.com".into(),
+            port: 6543,
+            database: "toko lama".into(),
+            user: "andri@kantor".into(),
+            password: "rahasia".into(),
+            ssl: SslMode::Require,
+        };
+        let url = cfg.url();
+        assert_eq!(url, "postgresql://andri%40kantor@db.example.com:6543/toko%20lama?sslmode=require");
+        assert!(!url.contains("rahasia") && !format!("{cfg:?}").contains("rahasia"));
+        let back = PgConfig::from_url(&url).unwrap();
+        assert_eq!(back, PgConfig { password: String::new(), ..cfg });
+        let v6 = PgConfig { host: "::1".into(), port: 5432, database: "d".into(), user: "u".into(), password: String::new(), ssl: SslMode::Prefer };
+        assert_eq!(PgConfig::from_url(&v6.url()), Some(v6));
+        assert_eq!(PgConfig::from_url("toko.db"), None);
+    }
 
     #[test]
     fn declared_types_split_into_type_and_length() {
