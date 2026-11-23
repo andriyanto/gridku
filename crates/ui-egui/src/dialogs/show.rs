@@ -644,7 +644,12 @@ pub(super) fn form_fields(app: &SheetApp, ui: &mut egui::Ui, d: &mut Dialog) {
                         let mut n = d.values.get(key).and_then(Json::as_f64).unwrap_or(0.0);
                         // Typed values count straight away: otherwise Enter or OK in the same frame
                         // confirms the old value, because a number field only commits when it loses focus.
-                        let r = ui.add(egui::DragValue::new(&mut n).speed(0.5).update_while_editing(true)).labelled_by(label.id);
+                        let mut drag = egui::DragValue::new(&mut n).speed(0.5).update_while_editing(true);
+                        if d.name == "cfQuick" {
+                            // Top/Bottom rank: whole items or percent, 1 to 1000 as Excel's spinner takes.
+                            drag = drag.fixed_decimals(0).range(1.0..=1000.0);
+                        }
+                        let r = ui.add(drag).labelled_by(label.id);
                         take_first_focus(d, &r);
                         if r.changed() {
                             d.values.insert(key.into(), json!(n));
@@ -655,9 +660,10 @@ pub(super) fn form_fields(app: &SheetApp, ui: &mut egui::Ui, d: &mut Dialog) {
                     ui.vertical(|ui| {
                         let field_label = ui.label(egui::RichText::new(lang.tr(label)).strong());
                         let cur = d.values.get(key).and_then(Json::as_str).unwrap_or("").to_string();
-                        if d.name == "dataValidation" {
+                        // Data Validation and the conditional-format "with" list are dropdowns, as in Excel.
+                        if d.name == "dataValidation" || (d.name == "cfQuick" && key == "preset") {
                             let selected = options.iter().find(|(val, _)| *val == cur).map(|(_, text)| lang.tr(text)).unwrap_or("");
-                            craft_ui::ComboBox::from_id_salt(("dataValidation", key))
+                            craft_ui::ComboBox::from_id_salt((d.name.as_str(), key))
                                 .selected_text(selected)
                                 .width(300.0)
                                 .show_ui(ui, |ui| {

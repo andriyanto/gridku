@@ -1012,6 +1012,49 @@ fn icon_sets_always_write_one_cfvo_per_icon() {
     assert_eq!(rules, [3, 4, 5]);
 }
 
+/// Excel 2010's icon sets (3 Triangles, 3 Stars, 5 Boxes) aren't in the 2006 schema: they're
+/// written only in the x14 extension, with their own priority and range, and read back from it.
+#[test]
+fn excel_2010_icon_sets_round_trip_through_the_x14_extension() {
+    let mut wb = Workbook::new();
+    let s = wb.sheet_mut(0).unwrap();
+    s.cond_formats.push(CondFormat {
+        ranges: vec![rr("A1:A5")],
+        rule: CfRule::IconSet { set: "3Arrows".into(), thresholds: vec![], reverse: false, show_value: true },
+        priority: 1,
+        stop_if_true: false,
+    });
+    s.cond_formats.push(CondFormat {
+        ranges: vec![rr("B1:B5"), rr("D1:D2")],
+        rule: CfRule::IconSet { set: "3Stars".into(), thresholds: vec![], reverse: true, show_value: false },
+        priority: 2,
+        stop_if_true: false,
+    });
+    let bytes = write_xlsx(&wb).unwrap();
+    let (xml, _) = sheet1_xml(&bytes);
+    assert!(!xml.contains("<iconSet iconSet=\"3Stars\""), "{xml}");
+    assert!(
+        xml.contains(
+            "<x14:cfRule type=\"iconSet\" priority=\"2\" id=\"{00000000-0000-0000-0000-000000000002}\"><x14:iconSet iconSet=\"3Stars\" reverse=\"1\" showValue=\"0\"><x14:cfvo type=\"percent\"><xm:f>0</xm:f></x14:cfvo>"
+        ),
+        "{xml}"
+    );
+    assert!(xml.contains("</x14:iconSet></x14:cfRule><xm:sqref>B1:B5 D1:D2</xm:sqref></x14:conditionalFormatting>"), "{xml}");
+    let (back, _) = read_xlsx(&bytes).unwrap();
+    let cfs = &back.sheet(0).unwrap().cond_formats;
+    assert_eq!(cfs.len(), 2);
+    let stars = cfs.iter().find(|cf| cf.priority == 2).unwrap();
+    assert_eq!(stars.ranges, vec![rr("B1:B5"), rr("D1:D2")]);
+    match &stars.rule {
+        CfRule::IconSet { set, thresholds, reverse, show_value } => {
+            assert_eq!(set, "3Stars");
+            assert_eq!(thresholds, &vec![CfValueKind::Percent(0.0), CfValueKind::Percent(33.0), CfValueKind::Percent(67.0)]);
+            assert!(*reverse && !*show_value);
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
 /// Files have no `@` operator. An `@` that legacy Excel implies is written without it in a
 /// legacy formula (no dynamic-array metadata); any other `@x` is written as `_xlfn.SINGLE(x)`
 /// in a dynamic-array formula. Both read back as written in the model.

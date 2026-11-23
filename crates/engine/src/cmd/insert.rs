@@ -1724,7 +1724,13 @@ fn add_cf(s: &mut Session, p: &Json) -> Result<Json> {
         "top10" => CfRule::Top10 {
             bottom: rule.get("bottom").and_then(Json::as_bool).unwrap_or(false),
             percent: rule.get("percent").and_then(Json::as_bool).unwrap_or(false),
-            rank: rule.get("rank").and_then(Json::as_u64).unwrap_or(10) as u32,
+            // Excel's Top 10 dialog takes 1 to 1000 items, or 1 to 100 percent; a dialog's
+            // number box sends a float.
+            rank: {
+                let percent = rule.get("percent").and_then(Json::as_bool).unwrap_or(false);
+                let rank = rule.get("rank").and_then(Json::as_f64).filter(|r| r.is_finite()).unwrap_or(10.0).round();
+                rank.clamp(1.0, if percent { 100.0 } else { 1000.0 }) as u32
+            },
             style,
         },
         "aboveAverage" => CfRule::AboveAverage { below: rule.get("below").and_then(Json::as_bool).unwrap_or(false), equal: false, std_dev: 0, style },

@@ -21,7 +21,8 @@ fn ok_and_cancel_sit_under_the_last_field() {
     );
     h.state_mut().open_dialog("cfQuick", json!({"type": "cellIs", "operator": "greaterThan", "title": "Greater Than…"}));
     h.run_steps(4);
-    let last = h.get_by_label("Red Border").rect();
+    // The last field is the "with" format dropdown.
+    let last = h.get_all_by_label("with").map(|n| n.rect()).fold(egui::Rect::NOTHING, |a, b| a.union(b));
     let ok = h.get_by_label_contains("OK").rect();
     let gap = ok.top() - last.bottom();
     assert!((0.0..40.0).contains(&gap), "OK is {gap} points under the last option");

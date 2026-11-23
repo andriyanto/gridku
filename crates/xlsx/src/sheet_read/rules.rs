@@ -133,6 +133,36 @@ pub(super) fn read_cf(cx: &mut Ctx<'_>, e: &El, sheet: &mut Sheet, kept_cells: &
     }
 }
 
+/// An x14 `cfRule` that is a rule of its own rather than the extension of a 2006 one: an Excel
+/// 2010 icon set (`3Triangles`, `3Stars`, `5Boxes`), which the 2006 schema can't hold. `block`
+/// is its `x14:conditionalFormatting`, whose `xm:sqref` child holds the ranges. Returns whether
+/// the rule was read; one past [`MAX_COND_CELLS`] kept range cells is dropped like in [`read_cf`].
+pub(super) fn read_x14_icon_set(cx: &mut Ctx<'_>, block: &El, r: &El, sheet: &mut Sheet) -> bool {
+    let (Some("iconSet"), Some(is)) = (r.attr("type"), r.child("iconSet")) else { return false };
+    let ranges = parse_sqref(block.child("sqref").map(|q| q.text.as_str()));
+    if ranges.is_empty() {
+        return false;
+    }
+    let kept = sheet.cond_formats.iter().flat_map(|cf| cf.ranges.iter()).map(RangeRef::count).fold(0u64, u64::saturating_add);
+    let block_cells = ranges.iter().map(RangeRef::count).fold(0u64, u64::saturating_add);
+    if kept.saturating_add(block_cells) > MAX_COND_CELLS {
+        cx.warn(format!("conditional formats past {MAX_COND_CELLS} kept range cells were dropped"));
+        return true;
+    }
+    sheet.cond_formats.push(CondFormat {
+        ranges,
+        rule: CfRule::IconSet {
+            set: is.attr("iconSet").unwrap_or("3TrafficLights1").to_string(),
+            thresholds: cfvos(is),
+            reverse: is.flag("reverse", false),
+            show_value: is.flag("showValue", true),
+        },
+        priority: r.attr_u32("priority").unwrap_or(0),
+        stop_if_true: r.flag("stopIfTrue", false),
+    });
+    true
+}
+
 /// A `dataValidation` (main namespace, or x14 with `xm:f` formulas and an `xm:sqref` child).
 pub(super) fn read_validation(v: &El) -> Option<Validation> {
     let sq = v.attr("sqref").map(str::to_string).or_else(|| v.child("sqref").map(|s| s.text.clone()));

@@ -2,11 +2,15 @@
 //!
 //! `cargo run --release -p gridcraft-ui-egui --example snapshot -- [--sample sales] [--in file.xlsx]
 //!  [--size 1440x900] [--scale 2] [--cmd 'id={json}']... [--tab Insert] [--dark] [--language en|es|zh|ja|ko|ru|pt|de|cs|fr|tr]
-//!  [--pane name] [--object id] [--dialog 'name={json}'] [--refedit key=A1:B2] [--hf-edit header|footer] out.png`
+//!  [--pane name] [--object id] [--dialog 'name={json}'] [--refedit key=A1:B2] [--hf-edit header|footer] [--click label]... [--hover label]... out.png`
 //!
 //! `--refedit key=range` collapses the open dialog to its reference box `key`, then selects
 //! `range` on the grid, as a person picking a range for that box does.
+//!
+//! `--click label` and `--hover label` (in the order given) click or hover the first widget whose
+//! accessible label contains `label`, e.g. a ribbon button and then a menu item, to picture menus.
 
+use egui_kittest::kittest::Queryable;
 use gridcraft_engine::Session;
 use gridcraft_ui_egui::SheetApp;
 use serde_json::json;
@@ -26,6 +30,7 @@ fn main() {
     let mut language: Option<String> = None;
     let mut hf_edit: Option<String> = None;
     let mut refedit: Option<String> = None;
+    let mut pointer: Vec<(bool, String)> = vec![];
     let mut out = "snapshot.png".to_string();
     let mut i = 0;
     while i < args.len() {
@@ -67,6 +72,10 @@ fn main() {
             "--object" | "--chart" => {
                 i += 1;
                 chart = args.get(i).and_then(|s| s.parse().ok());
+            }
+            "--click" | "--hover" => {
+                i += 1;
+                pointer.push((args[i - 1] == "--click", args.get(i).cloned().unwrap_or_default()));
             }
             "--dialog" => {
                 i += 1;
@@ -150,6 +159,20 @@ fn main() {
         }
         app.session.execute("selection.set", json!({"range": range})).expect("select");
         harness.run_steps(8);
+    }
+    for (click, label) in &pointer {
+        {
+            let Some(node) = harness.query_all_by_label_contains(label).next() else {
+                eprintln!("no widget labelled {label:?}");
+                continue;
+            };
+            if *click {
+                node.click();
+            } else {
+                node.hover();
+            }
+        }
+        harness.run_steps(6);
     }
     let img = harness.render().expect("render");
     img.save(&out).expect("save png");

@@ -864,72 +864,7 @@ impl Dialog {
                 data_validation_fields("any", "between"),
                 validation_defaults(app),
             ),
-            "cfQuick" => {
-                let ty = p("type").as_str().unwrap_or("cellIs").to_string();
-                let title = p("title").as_str().unwrap_or("Conditional Formatting").to_string();
-                let mut fields = vec![];
-                match ty.as_str() {
-                    "cellIs" => {
-                        fields.push(Text { key: "value", label: "Format cells that are (value):" });
-                        if p("operator").as_str() == Some("between") {
-                            fields.push(Text { key: "value2", label: "and:" });
-                        }
-                    }
-                    "containsText" => fields.push(Text { key: "text", label: "Format cells that contain the text:" }),
-                    "timePeriod" => fields.push(Choice {
-                        key: "period",
-                        label: "Format cells that contain a date occurring:",
-                        options: vec![
-                            ("yesterday", "Yesterday"),
-                            ("today", "Today"),
-                            ("tomorrow", "Tomorrow"),
-                            ("last7Days", "In the last 7 days"),
-                            ("lastWeek", "Last week"),
-                            ("thisWeek", "This week"),
-                            ("nextWeek", "Next week"),
-                            ("lastMonth", "Last month"),
-                            ("thisMonth", "This month"),
-                            ("nextMonth", "Next month"),
-                        ],
-                    }),
-                    _ => fields.push(Text { key: "formula", label: "Format values where this formula is true:" }),
-                }
-                fields.push(Choice {
-                    key: "preset",
-                    label: "with",
-                    options: vec![
-                        ("lightRedFillDarkRedText", "Light Red Fill with Dark Red Text"),
-                        ("yellowFillDarkYellowText", "Yellow Fill with Dark Yellow Text"),
-                        ("greenFillDarkGreenText", "Green Fill with Dark Green Text"),
-                        ("lightRedFill", "Light Red Fill"),
-                        ("redText", "Red Text"),
-                        ("redBorder", "Red Border"),
-                    ],
-                });
-                let mut d = Dialog::form(
-                    "cfQuick",
-                    &title,
-                    "home.conditionalFormat",
-                    fields,
-                    json!({"preset": "lightRedFillDarkRedText", "period": "today"}),
-                );
-                if ty == "expression" {
-                    let (sheet, applies_to) = app
-                        .session
-                        .active()
-                        .map(|doc| {
-                            (
-                                doc.wb.active().map(|sh| sh.name.clone()).unwrap_or_default(),
-                                doc.selection.ranges.iter().map(RangeRef::a1).collect::<Vec<_>>().join(","),
-                            )
-                        })
-                        .unwrap_or_default();
-                    d.pick = Some(RefPick { key: "formula", sheet, caret: 0, point: None, anchor: CellRef::new(0, 0), refocus: false, applies_to });
-                }
-                d.values.insert("type".into(), json!(ty));
-                d.values.insert("operator".into(), p("operator"));
-                d
-            }
+            "cfQuick" => cf_quick_dialog(app, &params),
             "formatCells" => {
                 let mut d = Dialog::custom("formatCells", "Format Cells", json!({}));
                 d.tab = p("tab").as_str().unwrap_or("Number").to_string();
@@ -1136,6 +1071,95 @@ impl Dialog {
         ref_edit::record_home(app, &mut d);
         Some(d)
     }
+}
+
+/// Conditional Formatting's quick dialogs (Greater Than…, Top 10 Items…, Duplicate Values…, New
+/// Rule…): the rule's own fields, then the "with" format.
+fn cf_quick_dialog(app: &SheetApp, params: &Json) -> Dialog {
+    use Field::*;
+    let p = |k: &str| params.get(k).cloned().unwrap_or(Json::Null);
+    let ty = p("type").as_str().unwrap_or("cellIs").to_string();
+    let title = p("title").as_str().unwrap_or("Conditional Formatting").to_string();
+    let mut fields = vec![];
+    match ty.as_str() {
+        "cellIs" => {
+            fields.push(Text { key: "value", label: "Format cells that are (value):" });
+            if p("operator").as_str() == Some("between") {
+                fields.push(Text { key: "value2", label: "and:" });
+            }
+        }
+        "containsText" => fields.push(Text { key: "text", label: "Format cells that contain the text:" }),
+        "duplicate" | "unique" => {
+            fields.push(Choice { key: "type", label: "Format cells that contain:", options: vec![("duplicate", "Duplicate"), ("unique", "Unique")] })
+        }
+        "top10" => {
+            let top = p("bottom").as_bool() != Some(true);
+            fields.push(Number {
+                key: "rank",
+                label: match (top, p("percent").as_bool() == Some(true)) {
+                    (true, false) => "Format cells that rank in the TOP (items):",
+                    (true, true) => "Format cells that rank in the TOP (%):",
+                    (false, false) => "Format cells that rank in the BOTTOM (items):",
+                    (false, true) => "Format cells that rank in the BOTTOM (%):",
+                },
+            });
+        }
+        "aboveAverage" => fields.push(Note(
+            if p("below").as_bool() == Some(true) { "Format cells that are BELOW AVERAGE:" } else { "Format cells that are ABOVE AVERAGE:" }.into(),
+        )),
+        "timePeriod" => fields.push(Choice {
+            key: "period",
+            label: "Format cells that contain a date occurring:",
+            options: vec![
+                ("yesterday", "Yesterday"),
+                ("today", "Today"),
+                ("tomorrow", "Tomorrow"),
+                ("last7Days", "In the last 7 days"),
+                ("lastWeek", "Last week"),
+                ("thisWeek", "This week"),
+                ("nextWeek", "Next week"),
+                ("lastMonth", "Last month"),
+                ("thisMonth", "This month"),
+                ("nextMonth", "Next month"),
+            ],
+        }),
+        _ => fields.push(Text { key: "formula", label: "Format values where this formula is true:" }),
+    }
+    fields.push(Choice {
+        key: "preset",
+        label: "with",
+        options: vec![
+            ("lightRedFillDarkRedText", "Light Red Fill with Dark Red Text"),
+            ("yellowFillDarkYellowText", "Yellow Fill with Dark Yellow Text"),
+            ("greenFillDarkGreenText", "Green Fill with Dark Green Text"),
+            ("lightRedFill", "Light Red Fill"),
+            ("redText", "Red Text"),
+            ("redBorder", "Red Border"),
+        ],
+    });
+    let mut d = Dialog::form("cfQuick", &title, "home.conditionalFormat", fields, json!({"preset": "lightRedFillDarkRedText", "period": "today"}));
+    if ty == "expression" {
+        let (sheet, applies_to) = app
+            .session
+            .active()
+            .map(|doc| {
+                (
+                    doc.wb.active().map(|sh| sh.name.clone()).unwrap_or_default(),
+                    doc.selection.ranges.iter().map(RangeRef::a1).collect::<Vec<_>>().join(","),
+                )
+            })
+            .unwrap_or_default();
+        d.pick = Some(RefPick { key: "formula", sheet, caret: 0, point: None, anchor: CellRef::new(0, 0), refocus: false, applies_to });
+    }
+    d.values.insert("type".into(), json!(ty));
+    d.values.insert("operator".into(), p("operator"));
+    // Top/Bottom and Average rules keep what the menu item chose.
+    for key in ["rank", "percent", "bottom", "below"] {
+        if !p(key).is_null() {
+            d.values.insert(key.into(), p(key));
+        }
+    }
+    d
 }
 
 #[cfg(test)]
