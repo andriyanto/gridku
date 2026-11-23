@@ -23,7 +23,7 @@ mod rules;
 
 pub(crate) use parts::password_attrs;
 use parts::{autofilter_xml, comments_xml, protected_ranges_xml, table_columns, table_name, table_xml, thread_ids, threaded_xml, vml_xml};
-use rules::{cf_rule_xml, solid_bar_id, validation_xml, x14_cfvo};
+use rules::{cf_rule_xml, solid_bar_id, validation_xml, x14_cfvo, x14_icon_set_xml};
 
 fn sqref(ranges: &[RangeRef]) -> String {
     ranges.iter().map(|r| r.a1()).collect::<Vec<_>>().join(" ")
@@ -237,10 +237,18 @@ fn write_sheet_extensions(s: &mut String, sheet: &Sheet, prio: &[u32]) {
         .filter(|(_, cf)| !cf.ranges.is_empty() && matches!(cf.rule, CfRule::DataBar { gradient: false, .. }))
         .map(|(i, cf)| (cf, prio.get(i).copied().unwrap_or(1)))
         .collect();
-    if !solid_bars.is_empty() || !sheet.sparklines.is_empty() {
+    let icon_sets: Vec<(&CondFormat, u32)> = sheet
+        .cond_formats
+        .iter()
+        .enumerate()
+        .filter(|(_, cf)| !cf.ranges.is_empty() && is_x14_only(cf))
+        .map(|(i, cf)| (cf, prio.get(i).copied().unwrap_or(1)))
+        .collect();
+    let has_ext = !solid_bars.is_empty() || !icon_sets.is_empty() || !sheet.sparklines.is_empty();
+    if has_ext {
         s.push_str("<extLst>");
     }
-    if !solid_bars.is_empty() {
+    if !solid_bars.is_empty() || !icon_sets.is_empty() {
         let _ = write!(
             s,
             "<ext uri=\"{{78C0D931-6437-407d-A8A1-0F90B4350D7D}}\" xmlns:x14=\"{X14_NS}\" xmlns:xm=\"{XM_NS}\"><x14:conditionalFormattings>"
@@ -251,6 +259,9 @@ fn write_sheet_extensions(s: &mut String, sheet: &Sheet, prio: &[u32]) {
                 let _ = write!(s, "<x14:conditionalFormatting><x14:cfRule type=\"dataBar\" id=\"{id}\"><x14:dataBar gradient=\"0\">{lo}{hi}");
                 let _ = write!(s, "</x14:dataBar></x14:cfRule><xm:sqref>{}</xm:sqref></x14:conditionalFormatting>", sqref(&cf.ranges));
             }
+        }
+        for (cf, p) in &icon_sets {
+            s.push_str(&x14_icon_set_xml(cf, *p));
         }
         s.push_str("</x14:conditionalFormattings></ext>");
     }
@@ -275,9 +286,14 @@ fn write_sheet_extensions(s: &mut String, sheet: &Sheet, prio: &[u32]) {
         }
         s.push_str("</x14:sparklineGroups></ext>");
     }
-    if !solid_bars.is_empty() || !sheet.sparklines.is_empty() {
+    if has_ext {
         s.push_str("</extLst>");
     }
+}
+
+/// A conditional format the 2006 schema can't hold: an Excel 2010 icon set.
+fn is_x14_only(cf: &CondFormat) -> bool {
+    matches!(&cf.rule, CfRule::IconSet { set, .. } if gridcraft_model::is_x14_icon_set(set))
 }
 
 fn write_sheet_notes(s: &mut String, sheet: &Sheet, si: usize, kept: &crate::passthrough::SheetKept<'_>, rels: &mut Rels, out: &mut Out) {
@@ -518,7 +534,8 @@ fn write_sheet_rules(s: &mut String, sheet: &Sheet, rels: &mut Rels, out: &mut O
         }
     }
     for (i, cf) in sheet.cond_formats.iter().enumerate() {
-        if cf.ranges.is_empty() {
+        // Excel 2010 icon sets go in the x14 extension only (see `write_sheet_extensions`).
+        if cf.ranges.is_empty() || is_x14_only(cf) {
             continue;
         }
         let _ = write!(

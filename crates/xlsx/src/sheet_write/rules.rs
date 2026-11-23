@@ -52,6 +52,42 @@ pub(super) fn x14_cfvo(v: &CfValueKind) -> String {
     format!("<x14:cfvo type=\"{ty}\"><xm:f>{}</xm:f></x14:cfvo>", esc(&val))
 }
 
+/// An icon set's thresholds as the file lists them: `CT_IconSet` needs one cfvo per icon
+/// (minOccurs 2), the first being the lower bound.
+pub(super) fn icon_cfvos(set: &str, thresholds: &[CfValueKind]) -> Vec<CfValueKind> {
+    let k = icon_count(set);
+    let defaults = default_icon_thresholds(set);
+    match thresholds.len() {
+        n if n == k => thresholds.to_vec(),
+        n if n + 1 == k => defaults.iter().take(1).chain(thresholds).cloned().collect(),
+        _ => defaults,
+    }
+}
+
+/// An Excel 2010 icon set (one the 2006 schema doesn't list), written only in the worksheet's
+/// x14 extension: an `x14:cfRule` with its own priority and an `x14:iconSet`.
+pub(super) fn x14_icon_set_xml(cf: &CondFormat, priority: u32) -> String {
+    let CfRule::IconSet { set, thresholds, reverse, show_value } = &cf.rule else { return String::new() };
+    let mut b = format!(
+        "<x14:conditionalFormatting><x14:cfRule type=\"iconSet\" priority=\"{priority}\"{} id=\"{}\"><x14:iconSet iconSet=\"{}\"",
+        if cf.stop_if_true { " stopIfTrue=\"1\"" } else { "" },
+        solid_bar_id(priority),
+        esc_attr(set)
+    );
+    if *reverse {
+        b.push_str(" reverse=\"1\"");
+    }
+    if !*show_value {
+        b.push_str(" showValue=\"0\"");
+    }
+    b.push('>');
+    for t in icon_cfvos(set, thresholds) {
+        b.push_str(&x14_cfvo(&t));
+    }
+    let _ = write!(b, "</x14:iconSet></x14:cfRule><xm:sqref>{}</xm:sqref></x14:conditionalFormatting>", super::sqref(&cf.ranges));
+    b
+}
+
 /// One `cfRule` element. The formulas generated for text, blank, error and date rules refer to the
 /// top-left cell of all the rule's areas, the cell Excel reads relative references from.
 pub(super) fn cf_rule_xml(cf: &CondFormat, priority: u32, out: &mut Out) -> String {
@@ -166,16 +202,8 @@ pub(super) fn cf_rule_xml(cf: &CondFormat, priority: u32, out: &mut Out) -> Stri
                 b.push_str(" showValue=\"0\"");
             }
             b.push('>');
-            // CT_IconSet needs one cfvo per icon (minOccurs 2); the first is the lower bound.
-            let k = icon_count(set);
-            let defaults = default_icon_thresholds(set);
-            let cfvos: Vec<&CfValueKind> = match thresholds.len() {
-                n if n == k => thresholds.iter().collect(),
-                n if n + 1 == k => defaults.iter().take(1).chain(thresholds).collect(),
-                _ => defaults.iter().collect(),
-            };
-            for t in cfvos {
-                b.push_str(&cfvo_xml(t));
+            for t in icon_cfvos(set, thresholds) {
+                b.push_str(&cfvo_xml(&t));
             }
             b.push_str("</iconSet>");
             format!("<cfRule type=\"iconSet\" priority=\"{priority}\"{stop}>{b}</cfRule>")

@@ -13,6 +13,7 @@ use crate::widgets::{
 };
 
 mod automate;
+mod cond_format_menu;
 mod contextual;
 mod controls;
 mod data;

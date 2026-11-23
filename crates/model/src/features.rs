@@ -259,6 +259,12 @@ pub fn icon_count(set: &str) -> usize {
     set.chars().next().and_then(|c| c.to_digit(10)).unwrap_or(3).clamp(3, 5) as usize
 }
 
+/// The icon sets Excel 2010 added (`3Triangles`, `3Stars`, `5Boxes`): the 2006 schema doesn't
+/// list them, so a file keeps them only in the worksheet's x14 extension.
+pub fn is_x14_icon_set(set: &str) -> bool {
+    matches!(set, "3Triangles" | "3Stars" | "5Boxes")
+}
+
 /// Excel's default icon-set thresholds: one per icon, the first being the lower bound,
 /// then even percent steps (`0, 33, 67` for three icons).
 pub fn default_icon_thresholds(set: &str) -> Vec<CfValueKind> {

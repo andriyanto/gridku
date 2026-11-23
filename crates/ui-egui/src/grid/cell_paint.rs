@@ -272,41 +272,7 @@ pub(crate) fn paint_border(p: &Painter, pts: [Pos2; 2], style: BorderStyle, col:
 }
 
 pub(super) fn paint_cf_icon(p: &Painter, r: Rect, set: &str, idx: usize) {
-    let n = gridcraft_engine::cf::icon_count(set);
-    let palette3 = [Color32::from_rgb(0xD1, 0x3B, 0x2F), Color32::from_rgb(0xF2, 0xB8, 0x2E), Color32::from_rgb(0x2E, 0x9E, 0x4F)];
-    let col = if n <= 3 {
-        palette3.get(idx).copied().unwrap_or(Color32::GRAY)
-    } else {
-        let t = idx as f32 / (n - 1).max(1) as f32;
-        Color32::from_rgb(
-            (0xD1 as f32 * (1.0 - t) + 0x2E as f32 * t) as u8,
-            (0x3B as f32 * (1.0 - t) + 0x9E as f32 * t) as u8,
-            (0x2F as f32 * (1.0 - t) + 0x4F as f32 * t) as u8,
-        )
-    };
-    let lower = set.to_ascii_lowercase();
-    if lower.contains("arrow") {
-        let c = r.center();
-        let s = r.width() / 2.0;
-        let pts = if idx + 1 == n {
-            vec![pos2(c.x, c.y - s), pos2(c.x + s, c.y + 0.1 * s), pos2(c.x - s, c.y + 0.1 * s)]
-        } else if idx == 0 {
-            vec![pos2(c.x, c.y + s), pos2(c.x - s, c.y - 0.1 * s), pos2(c.x + s, c.y - 0.1 * s)]
-        } else {
-            vec![pos2(c.x + s, c.y), pos2(c.x - 0.1 * s, c.y - s), pos2(c.x - 0.1 * s, c.y + s)]
-        };
-        p.add(egui::Shape::convex_polygon(pts, col, Stroke::NONE));
-    } else if lower.contains("rating") || lower.contains("quarter") {
-        p.circle_stroke(r.center(), r.width() / 2.0 - 0.5, Stroke::new(1.0, Color32::GRAY));
-        let frac = idx as f32 / (n - 1).max(1) as f32;
-        p.rect_filled(
-            Rect::from_min_size(pos2(r.left() + 2.0, r.bottom() - 2.0 - (r.height() - 4.0) * frac), vec2(r.width() - 4.0, (r.height() - 4.0) * frac)),
-            1.0,
-            Color32::from_rgb(0x2B, 0x7C, 0xD3),
-        );
-    } else {
-        p.circle_filled(r.center(), r.width() / 2.0 - 0.5, col);
-    }
+    crate::cf_icons::paint(p, r, set, idx);
 }
 
 /// Black or white, whichever reads on `fill` (the threshold chart labels use).

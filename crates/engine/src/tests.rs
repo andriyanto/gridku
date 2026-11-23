@@ -4516,6 +4516,28 @@ fn icon_set_thresholds_from_files_pick_the_icon() {
     assert_eq!([icon(&s, "A1"), icon(&s, "A2"), icon(&s, "A3"), icon(&s, "A4")], [Some(0), Some(1), Some(1), Some(2)]);
 }
 
+/// The Top 10 dialog's number box sends a float; the rank is rounded and kept to Excel's
+/// limits (1 to 1000 items, 1 to 100 percent).
+#[test]
+fn top_ten_rank_takes_dialog_numbers_within_excel_limits() {
+    use gridcraft_model::CfRule;
+    let mut s = s();
+    let rank = |s: &Session| match &s.doc().unwrap().wb.active().unwrap().cond_formats[0].rule {
+        CfRule::Top10 { rank, .. } => *rank,
+        other => panic!("{other:?}"),
+    };
+    for (rule, want) in [
+        (json!({"type": "top10", "rank": 5.0}), 5),
+        (json!({"type": "top10", "rank": 0}), 1),
+        (json!({"type": "top10", "rank": 5000}), 1000),
+        (json!({"type": "top10", "rank": 250.4, "percent": true}), 100),
+        (json!({"type": "top10"}), 10),
+    ] {
+        s.execute("home.conditionalFormat", json!({"range": "A1:A9", "rule": rule})).unwrap();
+        assert_eq!(rank(&s), want);
+    }
+}
+
 /// `home.conditionalFormat` styles take colours the way the other formatting commands do, refuse
 /// keys they would drop, and keep a text criterion already written as a string literal.
 #[test]

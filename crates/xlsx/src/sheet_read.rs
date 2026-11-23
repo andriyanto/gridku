@@ -25,7 +25,7 @@ mod rules;
 
 pub use parts::{read_autofilter, read_table};
 use parts::{read_comments, read_hyperlinks, read_note_shapes, read_threaded};
-use rules::{read_cf, read_validation};
+use rules::{read_cf, read_validation, read_x14_icon_set};
 
 struct Shared {
     anchor: CellRef,
@@ -902,8 +902,11 @@ fn read_ext(cx: &mut Ctx<'_>, e: &El, sheet: &mut Sheet) {
                 }
                 "conditionalFormattings" => {
                     let mut skipped = false;
-                    for r in c.kids("conditionalFormatting").flat_map(|f| f.kids("cfRule")) {
+                    for (f, r) in c.kids("conditionalFormatting").flat_map(|f| f.kids("cfRule").map(move |r| (f, r))) {
                         let idx = r.attr("id").and_then(|id| cx.cf_ext_ids.iter().find(|(i, _)| i == id)).map(|(_, n)| *n);
+                        if idx.is_none() && read_x14_icon_set(cx, f, r, sheet) {
+                            continue;
+                        }
                         match (idx.and_then(|n| sheet.cond_formats.get_mut(n)), r.child("dataBar")) {
                             (Some(CondFormat { rule: CfRule::DataBar { gradient, .. }, .. }), Some(db)) => {
                                 *gradient = db.flag("gradient", true);

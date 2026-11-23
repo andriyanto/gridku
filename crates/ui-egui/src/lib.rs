@@ -45,6 +45,7 @@ pub mod background;
 pub mod backstage;
 mod border_preview;
 mod cell_pictures;
+pub mod cf_icons;
 pub mod chartview;
 pub mod code_editor;
 pub mod control;
