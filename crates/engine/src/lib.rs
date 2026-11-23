@@ -21,6 +21,7 @@ pub mod outline;
 pub mod paper;
 pub mod pivot;
 pub mod pivot_calc;
+pub mod progress;
 pub mod recent;
 pub mod record;
 pub mod sample;
@@ -575,6 +576,8 @@ pub struct Session {
     pub text_width: Option<TextWidth>,
     /// Stops the running command's recalculation when asked to (see [`Session::interrupt`]).
     interrupt: Arc<gridcraft_calc::Interrupt>,
+    /// How far the running command has got, when it says ([`Session::progress`]).
+    progress: Arc<progress::Progress>,
     /// The open workbooks' names as of the last command, by uid, while any of them reads
     /// another ([`book_links`]): a workbook saved under another name is found by comparing.
     titles: Vec<(u64, String)>,
@@ -594,6 +597,11 @@ impl Session {
     /// formula. A request made while no command runs is forgotten when the next one starts.
     pub fn interrupt(&self) -> Arc<gridcraft_calc::Interrupt> {
         self.interrupt.clone()
+    }
+    /// How far the command this session is running has got, read from another thread while it
+    /// runs: only commands that know their size report it (loading a database table).
+    pub fn progress(&self) -> Arc<progress::Progress> {
+        self.progress.clone()
     }
     /// A copy of this session to read from while the session itself is away running a command
     /// on another thread ([`Session::interrupt`] stops that command): the same workbooks, windows,
@@ -647,6 +655,7 @@ impl Session {
             marks: Vec::new(),
             text_width: self.text_width.clone(),
             interrupt: Arc::default(),
+            progress: Arc::default(),
             titles: Vec::new(),
         })
     }
@@ -853,6 +862,7 @@ impl Session {
     /// recalculation listens for the next.
     fn listen_for_stop(&mut self) {
         self.interrupt.reset();
+        self.progress.clear();
         for d in self.docs.iter_mut().filter(|d| d.calc.interrupt.is_none()) {
             d.calc.interrupt = Some(self.interrupt.clone());
         }

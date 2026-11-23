@@ -26,6 +26,7 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError, channel}
 use std::time::Duration;
 
 use gridcraft_engine::calc::Interrupt;
+use gridcraft_engine::progress::Progress;
 use gridcraft_engine::{EngineError, Mode, Session, find_command};
 use serde_json::Value as Json;
 
@@ -74,12 +75,17 @@ pub(crate) enum After {
     /// A cell entry: on success move the selection as the key that entered it asks, on failure
     /// open the draft again.
     Edit { draft: Box<editor::EditState>, dr: i64, dc: i64 },
+    /// As [`After::Alert`], and on success a notice with what the command returned, in the
+    /// words this gives (loading a database table: how many rows).
+    Report(fn(&Json) -> String),
 }
 
 /// A command the worker is running.
 pub(crate) struct Busy {
     done: Receiver<Done>,
     stop: Arc<Interrupt>,
+    /// How far it has got, when it says (loading a database table).
+    progress: Arc<Progress>,
     /// When it was started ([`monotonic_ms`]).
     since: f64,
     /// Cancel was asked for.
@@ -121,6 +127,7 @@ pub(crate) enum Launch {
 pub(crate) struct Pending {
     done: Receiver<Done>,
     stop: Arc<Interrupt>,
+    progress: Arc<Progress>,
     mode: Mode,
     copied: bool,
     painting: bool,
@@ -201,6 +208,7 @@ impl SheetApp {
         }
         let Some(jobs) = self.background_state.worker.clone() else { return Launch::Done(self.session.run(id, params)) };
         let stop = self.session.interrupt();
+        let progress = self.session.progress();
         let (mode, copied, painting) = (self.session.mode, self.session.clipboard.is_some(), self.session.format_painter.is_some());
         let session = std::mem::replace(&mut self.session, stand_in);
         let (reply, done) = channel();
@@ -217,16 +225,17 @@ impl SheetApp {
                 self.session = back.session;
                 Launch::Done(back.result)
             }
-            Err(RecvTimeoutError::Timeout) => Launch::Pending(Pending { done, stop, mode, copied, painting }),
+            Err(RecvTimeoutError::Timeout) => Launch::Pending(Pending { done, stop, progress, mode, copied, painting }),
             Err(RecvTimeoutError::Disconnected) => Launch::Done(Err(self.session_lost(stop))),
         }
     }
 
     /// The app is busy with command `id` from here on.
     pub(crate) fn wait_in_background(&mut self, id: &str, window: Option<u64>, pending: Pending, after: After) {
-        let Pending { done, stop, mode, copied, painting } = pending;
+        let Pending { done, stop, progress, mode, copied, painting } = pending;
         let since = monotonic_ms();
-        self.background_state.busy = Some(Busy { done, stop, since, cancelling: false, id: id.to_string(), window, mode, copied, painting, after });
+        self.background_state.busy =
+            Some(Busy { done, stop, progress, since, cancelling: false, id: id.to_string(), window, mode, copied, painting, after });
     }
 
     /// The worker went away with the session. The stand-in is what is left of it: the workbooks
@@ -328,6 +337,14 @@ impl SheetApp {
         }
         let stopped = back.result.as_ref().is_err_and(|e| *e == EngineError::Cancelled.to_string());
         match busy.after {
+            After::Report(words) => {
+                let r = self.after_command(&busy.id, busy.window, back.result);
+                match r {
+                    Ok(r) => self.toast = Some((words(&r), now_ms())),
+                    Err(_) if stopped => {}
+                    Err(e) => self.alert(e),
+                }
+            }
             After::Alert => {
                 let r = self.after_command(&busy.id, busy.window, back.result);
                 self.note_copy(&busy.id, &r);
@@ -440,8 +457,14 @@ pub(crate) fn overlay(app: &mut SheetApp, ctx: &egui::Context) {
     let title = app.ui.language.tr(if cancelling { "Cancelling…" } else { "Calculating…" }).to_owned();
     let cancel_label = app.ui.language.tr("Cancel").to_owned();
     let mut cancel = false;
+    // A command that says how far it has got shows it: what it is doing, and a bar.
+    let progress = if cancelling { None } else { busy.progress.get() };
+    let title = match progress {
+        Some((phase, ..)) => format!("{}…", app.ui.language.tr(phase.label())),
+        None => title,
+    };
     egui::Modal::new(egui::Id::unique("background_command")).show(ctx, |ui| {
-        ui.set_width(260.0);
+        ui.set_width(if progress.is_some() { 340.0 } else { 260.0 });
         ui.horizontal(|ui| {
             ui.spinner();
             ui.label(egui::RichText::new(title).strong());
@@ -449,6 +472,13 @@ pub(crate) fn overlay(app: &mut SheetApp, ctx: &egui::Context) {
                 ui.label(format!("{seconds:.0} s"));
             }
         });
+        if let Some((_, done, total)) = progress {
+            ui.add_space(6.0);
+            let fraction = if total > 0 { (done as f32 / total as f32).clamp(0.0, 1.0) } else { 0.0 };
+            let text =
+                if total > 0 { format!("{} / {} ({:.0}%)", group_digits(done), group_digits(total), fraction * 100.0) } else { group_digits(done) };
+            ui.add(egui::ProgressBar::new(fraction).text(text).desired_width(ui.available_width()));
+        }
         ui.add_space(8.0);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if ui.add_enabled(!cancelling, egui::Button::new(cancel_label)).clicked() {
@@ -461,4 +491,28 @@ pub(crate) fn overlay(app: &mut SheetApp, ctx: &egui::Context) {
     }
     // The seconds, and the spinner.
     ctx.request_repaint_after(Duration::from_millis(100));
+}
+
+/// A count with its thousands grouped (`1,048,575`), for the progress bar.
+fn group_digits(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+#[cfg(test)]
+mod progress_tests {
+    #[test]
+    fn counts_are_grouped_by_thousands() {
+        assert_eq!(super::group_digits(0), "0");
+        assert_eq!(super::group_digits(999), "999");
+        assert_eq!(super::group_digits(1000), "1,000");
+        assert_eq!(super::group_digits(1_048_575), "1,048,575");
+    }
 }

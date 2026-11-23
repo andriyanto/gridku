@@ -5,7 +5,8 @@
 //! database's tables and views (`data.dbTables`); a click selects one, **Load** puts it in a new
 //! sheet as a table (`data.dbLoad`), and right-clicking one offers **Table Information…**, a
 //! window with each field's name, type and length (`data.dbColumns`). **Refresh** reads again the
-//! table at the active cell (`data.dbRefresh`).
+//! table at the active cell (`data.dbRefresh`). A large table loads in the background: the busy
+//! box shows the rows read, then written, as a progress bar, and Cancel stops it.
 
 use egui::{RichText, Ui};
 use serde_json::{Value as Json, json};
@@ -61,8 +62,19 @@ fn loaded_table_here(app: &SheetApp) -> Option<String> {
     d.wb.db_sources.iter().any(|s| s.table_id == t.id).then(|| t.name.clone())
 }
 
+/// Runs Load or Refresh. A large table goes on in the background with a progress bar and Cancel
+/// (`background.rs`); what it did is said when it is over.
+fn run_db(app: &mut SheetApp, id: &str, params: Json) {
+    match app.run_detached(id, params, crate::background::After::Report(loaded_message)) {
+        Some(Ok(r)) => app.toast = Some((loaded_message(&r), crate::now_ms())),
+        Some(Err(e)) if e == gridcraft_engine::EngineError::Cancelled.to_string() => {}
+        Some(Err(e)) => app.message = Some(("DB Connect".into(), crate::clean_error(&e))),
+        None => {}
+    }
+}
+
 /// What a load or refresh did, in a line.
-fn loaded_message(r: &Json) -> String {
+pub(crate) fn loaded_message(r: &Json) -> String {
     let rows = r["rows"].as_u64().unwrap_or(0);
     let what = if r["refreshed"].as_bool() == Some(true) { "Refreshed" } else { "Loaded" };
     let mut text = format!("{what} {} ({rows} {})", r["sheet"].as_str().unwrap_or(""), if rows == 1 { "row" } else { "rows" });
@@ -166,10 +178,7 @@ pub(crate) fn pane(app: &mut SheetApp, ui: &mut Ui) {
         if (load.clicked() || load_now)
             && let Some(table) = st.selected.clone()
         {
-            match app.run("data.dbLoad", json!({"engine": st.engine, "path": st.listed, "table": table})) {
-                Ok(r) => app.toast = Some((loaded_message(&r), crate::now_ms())),
-                Err(e) => app.message = Some(("DB Connect".into(), crate::clean_error(&e))),
-            }
+            run_db(app, "data.dbLoad", json!({"engine": st.engine, "path": st.listed, "table": table}));
         }
         let here = loaded_table_here(app);
         let refresh = ui
@@ -177,10 +186,7 @@ pub(crate) fn pane(app: &mut SheetApp, ui: &mut Ui) {
             .on_hover_text("Reads again the database table of the table at the active cell")
             .on_disabled_hover_text("Select a cell in a table loaded from a database");
         if refresh.clicked() {
-            match app.run("data.dbRefresh", json!({"table": here})) {
-                Ok(r) => app.toast = Some((loaded_message(&r), crate::now_ms())),
-                Err(e) => app.message = Some(("DB Connect".into(), crate::clean_error(&e))),
-            }
+            run_db(app, "data.dbRefresh", json!({"table": here}));
         }
     });
     table_info(ui, &mut st);

@@ -7,15 +7,18 @@ use std::time::Instant;
 use rusqlite::types::ValueRef;
 use rusqlite::{Connection, ErrorCode, OpenFlags};
 
-use crate::{ColumnInfo, DbError, DbValue, Limits, ObjectInfo, ObjectKind, RowKey, TableData, split_type};
+use crate::{ColumnInfo, DbError, DbValue, Limits, ObjectInfo, ObjectKind, RowKey, Stop, TableData, split_type};
 
-/// SQLite's own error as ours. An interrupted statement is the time limit's doing.
+/// SQLite's own error as ours. An interrupted statement was cancelled, or ran out of time.
 fn db_err(e: rusqlite::Error, limits: Option<&Limits>) -> DbError {
     match (&e, limits) {
         (rusqlite::Error::SqliteFailure(f, _), Some(l)) if f.code == ErrorCode::OperationInterrupted => DbError::TimedOut(l.timeout.as_secs()),
         _ => DbError::Database(e.to_string()),
     }
 }
+
+/// How often (in rows) a read reports its progress and asks whether to stop.
+const REPORT_EVERY: usize = 1000;
 
 /// Opens the database read-only. It must be an existing file: nothing is created. Its schema
 /// isn't trusted (functions it names run with the least rights), and no statement can write.
@@ -110,7 +113,15 @@ fn cut(text: &str, max: usize, cut_texts: &mut usize) -> String {
     }
 }
 
-pub(crate) fn read(path: &str, table: &str, limits: Limits) -> Result<TableData, DbError> {
+pub(crate) fn read(
+    path: &str,
+    table: &str,
+    limits: Limits,
+    stop: Option<Stop>,
+    progress: &mut dyn FnMut(usize, usize),
+) -> Result<TableData, DbError> {
+    let stopped = |s: &Option<Stop>| s.as_ref().is_some_and(|f| f());
+    let cancelled = |e: DbError, s: &Option<Stop>| if stopped(s) { DbError::Cancelled } else { e };
     let mut conn = open(path)?;
     let (kind, sql) = object(&conn, table)?;
     let mut columns = columns_of(&conn, table)?;
@@ -133,19 +144,32 @@ pub(crate) fn read(path: &str, table: &str, limits: Limits) -> Result<TableData,
         return Ok(TableData { columns, rows: Vec::new(), key, rowids: Vec::new(), truncated, cut_texts: 0 });
     }
     let query = format!("SELECT {} FROM {}", select.join(", "), quote(table));
-    // The time limit: SQLite asks every so many steps whether to go on.
+    // The time limit and the request to stop: SQLite asks every so many steps whether to go on.
     let deadline = Instant::now() + limits.timeout;
-    conn.progress_handler(10_000, Some(move || Instant::now() > deadline)).map_err(|e| db_err(e, None))?;
-    let mut st = conn.prepare(&query).map_err(|e| db_err(e, Some(&limits)))?;
-    let mut rows = st.query([]).map_err(|e| db_err(e, Some(&limits)))?;
-    let offset = usize::from(alias.is_some());
+    let asked = stop.clone();
+    conn.progress_handler(10_000, Some(move || Instant::now() > deadline || asked.as_ref().is_some_and(|f| f()))).map_err(|e| db_err(e, None))?;
     let width = columns.len().max(1);
     let max_rows = limits.max_rows.min(limits.max_cells / width);
+    // How many rows there are, for the progress (at most the rows read).
+    let count: i64 = conn
+        .query_row(&format!("SELECT count(*) FROM {}", quote(table)), [], |r| r.get(0))
+        .map_err(|e| cancelled(db_err(e, Some(&limits)), &stop))?;
+    let total = usize::try_from(count).unwrap_or(0).min(max_rows);
+    progress(0, total);
+    let mut st = conn.prepare(&query).map_err(|e| cancelled(db_err(e, Some(&limits)), &stop))?;
+    let mut rows = st.query([]).map_err(|e| cancelled(db_err(e, Some(&limits)), &stop))?;
+    let offset = usize::from(alias.is_some());
     let (mut out, mut rowids, mut cut_texts) = (Vec::new(), Vec::new(), 0usize);
-    while let Some(row) = rows.next().map_err(|e| db_err(e, Some(&limits)))? {
+    while let Some(row) = rows.next().map_err(|e| cancelled(db_err(e, Some(&limits)), &stop))? {
         if out.len() >= max_rows {
             truncated = true;
             break;
+        }
+        if out.len().is_multiple_of(REPORT_EVERY) && !out.is_empty() {
+            if stopped(&stop) {
+                return Err(DbError::Cancelled);
+            }
+            progress(out.len(), total.max(out.len()));
         }
         if alias.is_some() {
             rowids.push(row.get::<_, i64>(0).map_err(|e| db_err(e, Some(&limits)))?);
@@ -163,6 +187,7 @@ pub(crate) fn read(path: &str, table: &str, limits: Limits) -> Result<TableData,
         }
         out.push(values);
     }
+    progress(out.len(), out.len());
     Ok(TableData { columns, rows: out, key, rowids, truncated, cut_texts })
 }
 
@@ -204,6 +229,10 @@ mod tests {
         CREATE VIEW rich AS SELECT name FROM customers WHERE balance > 0;
     ";
 
+    fn read_all(path: &str, table: &str, limits: Limits) -> Result<TableData, DbError> {
+        read(path, table, limits, None, &mut |_, _| {})
+    }
+
     #[test]
     fn lists_tables_then_views_without_sqlites_own() {
         let db = TempDb::new("objects", SHOP);
@@ -236,21 +265,21 @@ mod tests {
     #[test]
     fn reads_values_and_how_rows_are_told_apart() {
         let db = TempDb::new("read", SHOP);
-        let t = read(db.path(), "customers", Limits::default()).unwrap();
+        let t = read_all(db.path(), "customers", Limits::default()).unwrap();
         assert_eq!(t.key, RowKey::Columns(vec![0]));
         assert_eq!(t.rows[0], [DbValue::Integer(1), DbValue::Text("Ana".into()), DbValue::Real(12.5), DbValue::Null, DbValue::Blob(4)]);
         assert_eq!(t.rows[1][1], DbValue::Text("Budi \"B\"".into()));
         // No primary key: the rowid, read alongside.
-        let t = read(db.path(), "log", Limits::default()).unwrap();
+        let t = read_all(db.path(), "log", Limits::default()).unwrap();
         assert_eq!((t.key, t.rowids), (RowKey::Rowid, vec![1, 2]));
         // A composite key, in key order.
-        let t = read(db.path(), "pairs", Limits::default()).unwrap();
+        let t = read_all(db.path(), "pairs", Limits::default()).unwrap();
         assert_eq!(t.key, RowKey::Columns(vec![1, 0]));
         // Columns called rowid and oid: `_rowid_` is the one left.
-        let t = read(db.path(), "odd \"name\"", Limits::default()).unwrap();
+        let t = read_all(db.path(), "odd \"name\"", Limits::default()).unwrap();
         assert_eq!((t.key, t.rowids.len(), t.rows[0].clone()), (RowKey::Rowid, 1, vec![DbValue::Text("r".into()), DbValue::Text("o".into())]));
         // A view has no key.
-        let t = read(db.path(), "rich", Limits::default()).unwrap();
+        let t = read_all(db.path(), "rich", Limits::default()).unwrap();
         assert_eq!((t.key, t.rows.len()), (RowKey::None, 1));
     }
 
@@ -258,13 +287,27 @@ mod tests {
     fn reads_are_bounded() {
         let db = TempDb::new("bounds", SHOP);
         let limits = Limits { max_rows: 1, max_text: 2, ..Limits::default() };
-        let t = read(db.path(), "customers", limits).unwrap();
+        let t = read_all(db.path(), "customers", limits).unwrap();
         assert!(t.truncated);
         assert_eq!((t.rows.len(), t.rows[0][1].clone(), t.cut_texts), (1, DbValue::Text("An".into()), 1));
-        let t = read(db.path(), "customers", Limits { max_columns: 2, ..Limits::default() }).unwrap();
+        let t = read_all(db.path(), "customers", Limits { max_columns: 2, ..Limits::default() }).unwrap();
         assert_eq!((t.columns.len(), t.rows[0].len(), t.truncated), (2, 2, true));
-        let t = read(db.path(), "customers", Limits { timeout: std::time::Duration::ZERO, ..Limits::default() });
+        let t = read_all(db.path(), "customers", Limits { timeout: std::time::Duration::ZERO, ..Limits::default() });
         assert!(matches!(t, Err(DbError::TimedOut(0))) || t.is_ok(), "{t:?}");
+    }
+
+    #[test]
+    fn a_read_reports_progress_and_stops_when_asked() {
+        let mut sql = String::from("CREATE TABLE big (n INTEGER);");
+        sql.push_str("WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 2500) INSERT INTO big SELECT x FROM c;");
+        let db = TempDb::new("progress", &sql);
+        let mut seen = Vec::new();
+        let t = read(db.path(), "big", Limits::default(), None, &mut |done, total| seen.push((done, total))).unwrap();
+        assert_eq!(t.rows.len(), 2500);
+        assert_eq!(seen, [(0, 2500), (1000, 2500), (2000, 2500), (2500, 2500)]);
+        // Asked to stop: it stops, whatever it was doing.
+        let stop: Stop = std::sync::Arc::new(|| true);
+        assert!(matches!(read(db.path(), "big", Limits::default(), Some(stop), &mut |_, _| {}), Err(DbError::Cancelled)));
     }
 
     #[test]

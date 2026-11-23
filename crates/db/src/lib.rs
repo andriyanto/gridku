@@ -16,7 +16,11 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 #![forbid(unsafe_code)]
 
+use std::sync::Arc;
 use std::time::Duration;
+
+/// Asked now and then while a read runs: `true` stops it ([`DbError::Cancelled`]).
+pub type Stop = Arc<dyn Fn() -> bool + Send + Sync>;
 
 #[cfg(not(target_arch = "wasm32"))]
 mod sqlite;
@@ -30,6 +34,8 @@ pub enum DbError {
     NoSuchTable(String),
     #[error("reading the table took longer than {0} seconds and was stopped")]
     TimedOut(u64),
+    #[error("reading the table was cancelled")]
+    Cancelled,
     #[error("databases can't be read in the web version")]
     Unavailable,
 }
@@ -165,13 +171,21 @@ pub fn sqlite_columns(path: &str, table: &str) -> Result<Vec<ColumnInfo>, DbErro
     }
 }
 
-/// Reads the table or view `table` of the SQLite database at `path`, within `limits`.
-pub fn sqlite_read(path: &str, table: &str, limits: Limits) -> Result<TableData, DbError> {
+/// Reads the table or view `table` of the SQLite database at `path`, within `limits`. `stop`,
+/// when given, is asked now and then whether to stop; `progress` hears how many rows have been
+/// read of how many there are (counted first, at most the rows read), every so many rows.
+pub fn sqlite_read(
+    path: &str,
+    table: &str,
+    limits: Limits,
+    stop: Option<Stop>,
+    progress: &mut dyn FnMut(usize, usize),
+) -> Result<TableData, DbError> {
     #[cfg(not(target_arch = "wasm32"))]
-    return sqlite::read(path, table, limits);
+    return sqlite::read(path, table, limits, stop, progress);
     #[cfg(target_arch = "wasm32")]
     {
-        let _ = (path, table, limits);
+        let _ = (path, table, limits, stop, progress);
         Err(DbError::Unavailable)
     }
 }
