@@ -477,7 +477,9 @@ pub(crate) fn overlay(app: &mut SheetApp, ctx: &egui::Context) {
             let fraction = if total > 0 { (done as f32 / total as f32).clamp(0.0, 1.0) } else { 0.0 };
             let text =
                 if total > 0 { format!("{} / {} ({:.0}%)", group_digits(done), group_digits(total), fraction * 100.0) } else { group_digits(done) };
-            ui.add(egui::ProgressBar::new(fraction).text(text).desired_width(ui.available_width()));
+            ui.label(text);
+            ui.add_space(4.0);
+            progress_bar(ui, (total > 0).then_some(fraction));
         }
         ui.add_space(8.0);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -489,8 +491,56 @@ pub(crate) fn overlay(app: &mut SheetApp, ctx: &egui::Context) {
     if cancel {
         app.cancel_background();
     }
-    // The seconds, and the spinner.
-    ctx.request_repaint_after(Duration::from_millis(100));
+    // The seconds, the spinner and the bar's sweep.
+    ctx.request_repaint_after(Duration::from_millis(if progress.is_some() { 33 } else { 100 }));
+}
+
+/// The busy box's bar, as wide as the box: the part done filled in the accent colour, with a
+/// lighter band sweeping across it so that it is seen to be alive between two counts; without a
+/// total (`None`) a segment runs back and forth.
+fn progress_bar(ui: &mut egui::Ui, fraction: Option<f32>) {
+    let t = crate::theme::Tokens::get(ui.ctx());
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 10.0), egui::Sense::hover());
+    let p = ui.painter();
+    let round = egui::CornerRadius::same(5);
+    p.rect_filled(rect, round, t.separator);
+    // The time drives the sweep (seconds, wrapping every 1.6 s).
+    let phase = ((ui.input(|i| i.time) % 1.6) / 1.6) as f32;
+    let filled = match fraction {
+        Some(f) => egui::Rect::from_min_size(rect.min, egui::vec2(rect.width() * f.clamp(0.0, 1.0), rect.height())),
+        None => {
+            let w = rect.width() * 0.3;
+            let x = rect.left() + (rect.width() - w) * (1.0 - (phase * 2.0 - 1.0).abs());
+            egui::Rect::from_min_size(egui::pos2(x, rect.top()), egui::vec2(w, rect.height()))
+        }
+    };
+    if filled.width() <= 0.5 {
+        return;
+    }
+    p.rect_filled(filled, round, t.accent);
+    if fraction.is_some() {
+        // A light band crossing the filled part, from left to right.
+        let band = (filled.width() * 0.35).clamp(12.0, 80.0);
+        let x = filled.left() - band + (filled.width() + band) * phase;
+        let shine =
+            egui::Rect::from_min_max(egui::pos2(x.max(filled.left()), filled.top()), egui::pos2((x + band).min(filled.right()), filled.bottom()));
+        if shine.width() > 0.5 {
+            let clear = egui::Color32::from_white_alpha(0);
+            let light = egui::Color32::from_white_alpha(90);
+            let mut mesh = egui::Mesh::default();
+            let mid = shine.center().x;
+            for (a, b, ca, cb) in [(shine.left(), mid, clear, light), (mid, shine.right(), light, clear)] {
+                let base = mesh.vertices.len() as u32;
+                mesh.colored_vertex(egui::pos2(a, shine.top()), ca);
+                mesh.colored_vertex(egui::pos2(b, shine.top()), cb);
+                mesh.colored_vertex(egui::pos2(b, shine.bottom()), cb);
+                mesh.colored_vertex(egui::pos2(a, shine.bottom()), ca);
+                mesh.add_triangle(base, base + 1, base + 2);
+                mesh.add_triangle(base, base + 2, base + 3);
+            }
+            p.with_clip_rect(filled.shrink2(egui::vec2(0.0, 0.5))).add(mesh);
+        }
+    }
 }
 
 /// A count with its thousands grouped (`1,048,575`), for the progress bar.

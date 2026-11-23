@@ -66,7 +66,8 @@ lists them through `app.commands`).
 
 9. **Progress, and Cancel.** Load and Refresh run in the background like other long commands
    (`ui-egui/src/background.rs`): the busy box says **Reading rows…**, then **Writing rows…**,
-   with a progress bar and the count (`412,000 / 1,048,575 (39%)`), counted first with
+   with the count (`412,000 / 1,048,575 (39%)`) and under it a bar as wide as the box, a light
+   band sweeping across its filled part, counted first with
    `count(*)`. Cancel (or Esc) stops it in either phase, also inside a slow SQLite statement,
    and nothing changes. The engine reports through `Session::progress`, which any long command
    can use.
