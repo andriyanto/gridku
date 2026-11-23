@@ -493,6 +493,8 @@ fn write_sheets(
 ) -> (String, crate::passthrough::WorkbookKept, crate::pivot::PivotWriter) {
     // Kept content first: the chart sheets among the worksheets need their relationship ids.
     let kept = crate::passthrough::write_workbook(wb, wb_rels, out);
+    // After the kept parts, whose custom XML items keep their numbers.
+    crate::db_sources::write(wb, wb_rels, out);
     let mut pivots = crate::pivot::PivotWriter::default();
     let mut sheets_xml = String::new();
     let any_visible = wb.sheets.iter().any(|s| s.visibility == Visibility::Visible);

@@ -502,6 +502,11 @@ pub fn read_xlsx<'a>(bytes: &'a [u8], opts: crate::ReadOptions<'a>) -> Result<(W
             Err(e) => cx.warn(format!("macros (VBA project) could not be read and were dropped: {e}")),
         }
     }
+    // Where loaded database tables came from: GridKu's own custom XML part, modelled rather
+    // than kept.
+    if let Some(part) = crate::db_sources::read(&mut cx, &wb_rels, &mut wb) {
+        kept.skip_part(part);
+    }
     wb.preserved = kept.workbook(&mut cx, &wb_part, &wb_xml, &file_to_model);
     if let Some(w) = cx.python.warning() {
         cx.warn(w);

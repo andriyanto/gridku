@@ -60,6 +60,7 @@ fn open(s: &mut Session, p: &Json) -> Result<Json> {
     let encrypted = gridcraft_xlsx::sniff(&bytes) == gridcraft_xlsx::Format::Encrypted;
     let (mut wb, warnings) = crate::io::open_bytes_with(&name, &bytes, str_param(p, "password"), bool_param(p, "csvAsText").unwrap_or(false))?;
     wb.source_dir = str_param(p, "path").and_then(crate::io::source_dir);
+    crate::io::resolve_db_locations(&mut wb);
     // What `CELL("filename")` reports (#1489). A workbook opened from bytes knows its name but
     // never a folder, so it reports `[name]Sheet` with none; an import reports the file it came
     // from, as Excel does, even though Save must still ask where to put the .xlsx.
