@@ -1,6 +1,6 @@
 # References to other workbooks
 
-> **Last reviewed:** 2026-11-18 · **Last updated:** 2026-11-18 · **Change:** minor (stage C built: Update Values and Open Source read a linked workbook's file when asked; earlier: stage B; steps A1 to A4; the design) · **Target:** Microsoft Excel (Microsoft 365)
+> **Last reviewed:** 2026-11-18 · **Last updated:** 2026-11-23 · **Change:** minor (Edit Links finds every place a link is used, Find Next, Break All; earlier: stage C built: Update Values and Open Source read a linked workbook's file when asked; earlier: stage B; steps A1 to A4; the design) · **Target:** Microsoft Excel (Microsoft 365)
 
 A formula that reads a cell of another workbook: `=[Budget.xlsx]Sheet1!B4`. This page is the
 design, written before the work; the table of steps says which are built. Statements about Excel come from the
@@ -193,7 +193,20 @@ is. The path is shown as text and is not looked for.
 - **Break Link** (`data.breakLink`) replaces every cell formula that reads the workbook with
   its value (a formula that fills several cells with all of them) and takes the link out. It is
   one Undo step, where Excel's can't be undone. A defined name is not a value: one that reads
-  the workbook stays, and the link with it; the command says which.
+  the workbook stays, and the link with it; the command says which. So do conditional formats,
+  data validation, chart series and titles, sparklines and PivotTable sources that read it
+  (the places Excel's Break Link leaves too, the "links that won't break"): they are left for
+  a person to change, the link stays while any of them reads it, and the command counts them
+  (`kept`). `{all: true}` (Break All) breaks every link, as one Undo step.
+- **Where it is used** (`data.linkUses`) lists every place that reads a link, in order: cells
+  sheet by sheet, defined names, then per sheet conditional formats, data validation, charts,
+  sparklines and PivotTables, each with its sheet and range (or name, or chart id) and whether
+  it is hidden. A formula may name the link by the number the file gave it (`[1]`), as
+  conditional formats and validation rules read from a file do; that counts too. The dialog
+  says where the selected link is used ("Used in 3 cells, 1 conditional format"), or that it
+  is used nowhere (a link the file listed that nothing reads), and **Find Next** goes to each
+  place in turn: it selects the cells, the rule's or validation's range, or the chart; a
+  defined name, and anything on a hidden sheet, is named on the line under it instead.
 - A link the file brought leaves the file when broken only if it is the last of the file's
   links: the others are known to formulas by their place in the list, and conditional formats,
   validation rules and charts keep those numbers as text. One that is not the last keeps its
@@ -273,6 +286,7 @@ smallest and comes last because it makes the feature reachable.
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-11-23 | minor | Edit Links says where each link is used (cells, defined names, conditional formats, data validation, charts, sparklines, PivotTables, also by the file's link number) and Find Next goes to each place; Break Link keeps the link while any of those still reads it and says which; Break All |
 | 2026-11-18 | minor | C: Update Values reads a linked workbook's file when asked (a workbook, on this computer, never from a script); Open Source; Change Source to a file reads it at once; a bar says so when a workbook with closed sources opens |
 | 2026-11-18 | minor | B: Edit Links lists the workbooks read and what is known of each; Change Source points the formulas at another workbook; Break Link leaves their values, as one Undo step. Also: the values a source's formulas spilled are read (a reference into a spilled range was blank) |
 | 2026-11-18 | minor | A4: a formula that can take a reference goes with the keyboard to another window; a click there writes `[Name]Sheet!A1`, Enter and Esc bring its own window back |
