@@ -20,6 +20,7 @@ gridcraft-functions = { path = "crates/functions" }
 gridcraft-model = { path = "crates/model" }
 gridcraft-calc = { path = "crates/calc" }
 gridcraft-xlsx = { path = "crates/xlsx" }
+gridcraft-db = { path = "crates/db" }
 gridcraft-chart = { path = "crates/chart" }
 gridcraft-engine = { path = "crates/engine" }
 gridcraft-ui-egui = { path = "crates/ui-egui" }
@@ -48,6 +49,9 @@ sha2 = { version = "0.11", default-features = false }
 aes = { version = "0.9", default-features = false }
 sha1 = { version = "0.11", default-features = false }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+# Reading SQLite databases (Data › DB Connect). MIT; SQLite itself is public domain and built in
+# from source (`bundled`), so no system library is needed. Desktop only (not wasm32).
+rusqlite = { version = "0.43", default-features = false, features = ["bundled", "hooks"] }
 
 # equations: RaTeX (MIT) lays LaTeX out as positioned glyphs, rules and paths. Exact pins: it is
 # young (0.1.x), and the gate recorded in docs/decisions.md vetted this release.

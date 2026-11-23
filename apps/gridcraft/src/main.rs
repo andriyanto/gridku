@@ -180,6 +180,13 @@ fn services() -> Services {
                 .pick_file()
                 .and_then(|p| p.to_str().map(str::to_string))
         })),
+        pick_database: Some(Box::new(|| {
+            rfd::FileDialog::new()
+                .add_filter("SQLite Database", &["db", "sqlite", "sqlite3", "db3", "s3db", "sl3"])
+                .add_filter("All Files", &["*"])
+                .pick_file()
+                .and_then(|p| p.to_str().map(str::to_string))
+        })),
         pick_picture: Some(Box::new(|| {
             rfd::FileDialog::new()
                 .add_filter("Pictures (PNG, JPEG)", &["png", "jpg", "jpeg"])

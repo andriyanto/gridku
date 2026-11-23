@@ -7,6 +7,7 @@
 mod b64;
 pub mod cell;
 mod cellmap;
+pub mod db;
 pub mod features;
 pub mod links;
 pub mod macros;
@@ -19,6 +20,7 @@ pub mod style;
 pub mod workbook;
 
 pub use cell::{Cell, CellPicture, Formula};
+pub use db::{DbColumn, DbEngine, DbRowKey, DbSource};
 pub use features::*;
 pub use links::{ExternalLink, LinkSheet, Links};
 pub use macros::*;

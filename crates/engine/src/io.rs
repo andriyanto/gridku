@@ -903,6 +903,12 @@ impl Drop for ScriptSandbox {
     }
 }
 
+/// Refuses file access where scripts and macro steps may not touch files, as reading or writing
+/// a file does ([`read_file`]): for readers that open a file themselves (a database).
+pub(crate) fn check_file_access(path: &str) -> Result<()> {
+    script_sandbox_check(path)
+}
+
 /// Refuses file access while a [`ScriptSandbox`] is alive (and, failing closed, while the
 /// thread is being torn down).
 fn script_sandbox_check(path: &str) -> Result<()> {

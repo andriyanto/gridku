@@ -100,6 +100,8 @@ pub enum Icon {
     Picture,
     Shapes,
     Link,
+    /// A database: a cylinder (Data › DB Connect).
+    Database,
     Comment,
     Note,
     TextBox,
@@ -301,6 +303,25 @@ pub fn paint_accent(p: &Painter, rect: Rect, icon: Icon, c: Color32, accent: Opt
 /// Draws `icon` on the sheet, which stays white in both themes, so with the light palette.
 pub fn paint_on_sheet(p: &Painter, rect: Rect, icon: Icon, c: Color32) {
     paint_with(p, rect, icon, c, &Palette::of(&Tokens::light()));
+}
+
+/// A database: a cylinder, its side, the top's ellipse and two bands around it.
+fn database(g: &G<'_>, pal: &Palette) {
+    let blue = pal.cat(Cat::Blue);
+    // A cylinder: the side, the top's ellipse and two bands around it.
+    let ring = |cy: f32, from: f32, to: f32| -> Vec<(f32, f32)> {
+        (0..=12).map(|i| from + (to - from) * i as f32 / 12.0).map(|a: f32| (8.0 + 5.5 * a.cos(), cy + 1.8 * a.sin())).collect()
+    };
+    let pi = std::f32::consts::PI;
+    let mut side = ring(3.8, pi, 2.0 * pi);
+    side.extend(ring(12.2, 0.0, pi));
+    g.poly(&side, pal.wash(Cat::Blue));
+    for cy in [6.6, 9.4, 12.2] {
+        g.line(&ring(cy, 0.0, pi), blue, 1.0);
+    }
+    g.line(&ring(3.8, 0.0, 2.0 * pi), blue, 1.1);
+    g.line(&[(2.5, 3.8), (2.5, 12.2)], blue, 1.1);
+    g.line(&[(13.5, 3.8), (13.5, 12.2)], blue, 1.1);
 }
 
 /// Draws `icon` into `rect` (square-ish), in colour `c`, with palette `pal`.
@@ -623,6 +644,7 @@ fn paint_with(p: &Painter, rect: Rect, icon: Icon, c: Color32, pal: &Palette) {
             g.rect(2.0, 8.0, 6.0, 4.0, None, Some(c));
             g.rect(8.0, 4.0, 6.0, 4.0, None, Some(c));
         }
+        Icon::Database => database(&g, pal),
         Icon::Comment | Icon::Note => {
             g.poly(&[(2.0, 3.0), (14.0, 3.0), (14.0, 11.0), (2.0, 11.0)], if icon == Icon::Note { pal.wash(Cat::Amber) } else { paper });
             g.line(&[(2.0, 3.0), (14.0, 3.0), (14.0, 11.0), (7.0, 11.0), (4.0, 14.0), (4.0, 11.0), (2.0, 11.0), (2.0, 3.0)], c, 1.1);
@@ -936,6 +958,7 @@ pub const LIBRARY: &[(&str, Icon)] = &[
     ("search", Icon::Search),
     ("calculator", Icon::Calc),
     ("link", Icon::Link),
+    ("database", Icon::Database),
     ("pen", Icon::Pen),
     ("share", Icon::Share),
     ("settings", Icon::Settings),

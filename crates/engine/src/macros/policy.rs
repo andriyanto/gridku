@@ -72,6 +72,10 @@ pub fn macro_policy(id: &str, params: &Json, trust: Trust) -> Policy {
         Policy::Deny((*why).into())
     } else if READS_FILES.contains(&id) && has_path {
         Policy::NeedsPermission("reads a file".into())
+    } else if id.starts_with("data.db") {
+        // A database is a file (or, later, a server) whether or not the step names it:
+        // Refresh reads the one the table was loaded from.
+        Policy::NeedsPermission("reads a database".into())
     } else {
         Policy::Allow
     };

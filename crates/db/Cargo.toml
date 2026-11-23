@@ -1,0 +1,18 @@
+[package]
+name = "gridcraft-db"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "GridKu database sources: list a database's tables and columns and read a table (SQLite)"
+
+[lints]
+workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+
+# SQLite is built in (its C source, public domain, through libsqlite3-sys): no system library is
+# needed. Not on the web: the C library does not build for wasm32-unknown-unknown, so there the
+# functions say the database can't be read.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+rusqlite = { workspace = true }
