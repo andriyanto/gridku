@@ -716,9 +716,16 @@ fn save_as(app: &mut SheetApp, ui: &mut Ui, bs: &mut Backstage, out: &mut Outcom
 
 fn export(app: &mut SheetApp, ui: &mut Ui, out: &mut Outcome) {
     let lang = app.ui.language;
-    if action_row(ui, Icon::Paper, lang.tr("Create PDF"), lang.tr("Save the sheet as a PDF document that keeps its page layout.")).clicked()
-        && export_as(app, "pdf")
+    if action_row(
+        ui,
+        Icon::Paper,
+        lang.tr("Create PDF"),
+        lang.tr("Save the active sheet, the selection or the whole workbook as a PDF that keeps its page layout: one file, or one per sheet."),
+    )
+    .clicked()
+        && app.commit_edit(0, 0, false, false)
     {
+        app.open_dialog("exportPdf", json!({}));
         out.close = true;
     }
     ui.add_space(14.0);

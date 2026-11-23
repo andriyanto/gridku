@@ -929,6 +929,31 @@ impl Dialog {
             }
             "nameManager" => Dialog::custom("nameManager", "Name Manager", json!({})),
             "editLinks" => Dialog::custom("editLinks", "Edit Links", json!({})),
+            "exportPdf" => {
+                // Excel's Options… of Export › Create PDF: what to publish, and (ours) the whole
+                // workbook as one PDF or one PDF per sheet.
+                let selection = app.session.active().map(|doc| doc.selection.current().a1()).unwrap_or_default();
+                let mut d = Dialog::form(
+                    "exportPdf",
+                    "Export to PDF",
+                    "file.exportPdf",
+                    vec![
+                        Choice {
+                            key: "sheets",
+                            label: "Publish what",
+                            options: vec![("selection", "Selection"), ("active", "Active sheet"), ("all", "Entire workbook")],
+                        },
+                        Choice {
+                            key: "files",
+                            label: "Entire workbook as",
+                            options: vec![("one", "One PDF file"), ("each", "A separate PDF file for each sheet")],
+                        },
+                    ],
+                    json!({"sheets": p("sheets").as_str().unwrap_or("active"), "files": "one"}),
+                );
+                d.values.insert("selection".into(), json!(selection));
+                d
+            }
             "pasteName" => {
                 // F3 opens it only when the workbook has names to paste, as in Excel.
                 let names = pasteable_names(app);
@@ -1165,6 +1190,25 @@ fn cf_quick_dialog(app: &SheetApp, params: &Json) -> Dialog {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn export_pdf_options_send_what_to_publish_and_one_file_or_one_per_sheet() {
+        let mut session = gridcraft_engine::Session::default();
+        session.new_workbook();
+        session.execute("selection.set", json!({"range": "B2:C5"})).unwrap();
+        let mut app = SheetApp::new(session, Default::default());
+        let mut d = Dialog::open(&mut app, "exportPdf", json!({})).unwrap();
+        assert_eq!(build_params(&d), json!({"sheets": "active", "split": false}));
+        d.set_value("sheets", json!("selection"));
+        assert_eq!(build_params(&d), json!({"sheets": "active", "split": false, "range": "B2:C5"}));
+        d.set_value("sheets", json!("all"));
+        assert_eq!(build_params(&d), json!({"sheets": "all", "split": false}));
+        d.set_value("files", json!("each"));
+        assert_eq!(build_params(&d), json!({"sheets": "all", "split": true}));
+        // One file per sheet is for the whole workbook only.
+        d.set_value("sheets", json!("active"));
+        assert_eq!(build_params(&d)["split"], false);
+    }
 
     #[test]
     fn remove_duplicates_prefills_the_selection_and_submits_the_edited_range() {

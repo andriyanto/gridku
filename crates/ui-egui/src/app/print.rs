@@ -6,6 +6,19 @@ impl SheetApp {
         if result.get("path").is_some() {
             return;
         }
+        // One PDF per sheet: each is its own download.
+        if let Some(files) = result.get("files").and_then(Json::as_array) {
+            if let Some(dl) = &self.services.download {
+                for f in files.iter().filter(|f| f.get("path").is_none()) {
+                    if let (Some(name), Some(b)) =
+                        (f.get("name").and_then(Json::as_str), f.get("base64").and_then(Json::as_str).and_then(gridcraft_engine::io::base64_decode))
+                    {
+                        dl(name, &b);
+                    }
+                }
+            }
+            return;
+        }
         if let Some(dl) = &self.services.download
             && let Some(b) = result.get("base64").and_then(Json::as_str).and_then(gridcraft_engine::io::base64_decode)
         {
@@ -33,7 +46,10 @@ impl SheetApp {
             other => *other = json!({"path": path}),
         }
         match self.run("file.exportPdf", params) {
-            Ok(_) => self.exported_to(&path),
+            Ok(r) => match r.get("files").and_then(Json::as_array) {
+                Some(files) => self.toast = Some((exported_files_message(&path, files.len()), now_ms())),
+                None => self.exported_to(&path),
+            },
             Err(e) => self.alert(e),
         }
     }
@@ -97,6 +113,14 @@ impl SheetApp {
 }
 
 /// "Exported Book1.pdf to /home/me/Documents": the file's name, then its folder.
+/// Says where a workbook exported one PDF per sheet went: beside the name chosen.
+pub(crate) fn exported_files_message(path: &str, count: usize) -> String {
+    match std::path::Path::new(path).parent().map(|p| p.to_string_lossy()).filter(|p| !p.is_empty()) {
+        Some(folder) => format!("Exported {count} PDF files, one per sheet, to {folder}"),
+        None => format!("Exported {count} PDF files, one per sheet"),
+    }
+}
+
 pub(crate) fn exported_message(path: &str) -> String {
     let path = std::path::Path::new(path);
     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.to_string_lossy().into_owned());

@@ -51,7 +51,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Export as PDF",
             ["File", "Export"],
             None,
-            "{path?, sheets?: active|all, range?: \"A1:F40\" (active sheet), fitToPage?: bool} → {pages, bytes, path} or {pages, bytes, base64} when no path. Honours each sheet's Page Setup.",
+            "{path?, sheets?: active|all, range?: \"A1:F40\" (active sheet), fitToPage?: bool, split?: bool (one PDF per sheet: `path` names the first part, each file is `<name> - <sheet>.pdf`)} → {pages, bytes, path} or {pages, bytes, base64} when no path; with `split` and several sheets {pages, files: [{sheet, pages, bytes, path | name + base64}]}. Honours each sheet's Page Setup.",
             has_doc,
             export_pdf
         ),
@@ -180,7 +180,70 @@ fn build_pdf(s: &Session, p: &Json, cmd: &str) -> Result<(Vec<u8>, usize)> {
     Ok(render_pdf(&d.wb, &lays, &d.display_title(), &path))
 }
 
+/// A sheet name made safe as part of a file name on every system: the characters Windows
+/// refuses in file names (a sheet name may hold `<`, `>`, `|`, `"`) become `_`, and the name
+/// doesn't end in a dot or a space.
+fn file_part(sheet: &str) -> String {
+    let s: String = sheet.chars().map(|c| if c.is_control() || "<>:\"/\\|?*".contains(c) { '_' } else { c }).collect();
+    let s = s.trim_end_matches(['.', ' ']).to_string();
+    if s.is_empty() { "Sheet".to_string() } else { s }
+}
+
+/// The file of one sheet's part of a split export: `Report.pdf` and `Sales` give `Report - Sales.pdf`
+/// beside it.
+fn split_path(path: &str, sheet: &str) -> String {
+    let p = std::path::Path::new(path);
+    let stem = p.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "Book1".into());
+    let name = format!("{stem} - {}.pdf", file_part(sheet));
+    match p.parent().filter(|d| !d.as_os_str().is_empty()) {
+        Some(dir) => dir.join(name).to_string_lossy().into_owned(),
+        None => name,
+    }
+}
+
+/// File › Export › PDF with "one file per sheet": each sheet that prints is its own PDF, its
+/// pages numbered from 1. `None` when one file is to be written (one sheet, or no `split`).
+fn export_split(s: &Session, p: &Json) -> Result<Option<Json>> {
+    const ID: &str = "file.exportPdf";
+    if !bool_param(p, "split").unwrap_or(false) {
+        return Ok(None);
+    }
+    let opts = PrintOptions::from_params(p, ID)?;
+    let d = s.doc()?;
+    let lays = layouts(&d.wb, &opts);
+    if lays.len() < 2 {
+        return Ok(None);
+    }
+    let book_path = d.path.clone().unwrap_or_default();
+    let title = d.display_title();
+    let to = str_param(p, "path").filter(|x| !x.is_empty());
+    let mut files = Vec::new();
+    let mut total = 0usize;
+    for lay in &lays {
+        let sheet = d.wb.sheet(lay.sheet).map(|sh| sh.name.clone()).unwrap_or_default();
+        let (bytes, pages) = render_pdf(&d.wb, std::slice::from_ref(lay), &title, &book_path);
+        total += pages;
+        let mut f = json!({"sheet": sheet, "pages": pages, "bytes": bytes.len()});
+        match to {
+            Some(path) => {
+                let file = split_path(path, &sheet);
+                crate::io::write_file(&file, &bytes)?;
+                f["path"] = json!(file);
+            }
+            None => {
+                f["name"] = json!(split_path(&title, &sheet));
+                f["base64"] = json!(crate::io::base64_encode(&bytes));
+            }
+        }
+        files.push(f);
+    }
+    Ok(Some(json!({"pages": total, "files": files})))
+}
+
 pub(crate) fn export_pdf(s: &mut Session, p: &Json) -> Result<Json> {
+    if let Some(split) = export_split(s, p)? {
+        return Ok(split);
+    }
     let (bytes, pages) = build_pdf(s, p, "file.exportPdf")?;
     match str_param(p, "path").filter(|x| !x.is_empty()) {
         Some(path) => {

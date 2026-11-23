@@ -81,6 +81,18 @@ pub(crate) fn build_params(d: &Dialog) -> Json {
                 }
             }
         }
+        "exportPdf" => {
+            // "Selection" is the active sheet's selected range; "one file per sheet" only when
+            // the whole workbook is published.
+            let what = d.values.get("sheets").and_then(Json::as_str).unwrap_or("active");
+            let each = what == "all" && d.values.get("files").and_then(Json::as_str) == Some("each");
+            v = json!({"sheets": if what == "all" { "all" } else { "active" }, "split": each});
+            if what == "selection"
+                && let Some(range) = d.values.get("selection").and_then(Json::as_str)
+            {
+                v["range"] = json!(range);
+            }
+        }
         "cfQuick" => {
             let mut rule = Map::new();
             for (k, val) in &d.values {
@@ -120,6 +132,21 @@ pub(crate) fn build_params(d: &Dialog) -> Json {
         _ => {}
     }
     v
+}
+
+/// OK of a dialog that doesn't just run its command: Open Hyperlink asks first; Export to PDF,
+/// its options chosen, asks where to save (the save picker, or a download on the web) as the
+/// menu command does. Returns whether the dialog closes.
+fn has_own_confirm(d: &Dialog) -> bool {
+    matches!(d.name.as_str(), "openLink" | "exportPdf")
+}
+
+fn confirm_own(app: &mut SheetApp, d: &Dialog) -> bool {
+    if d.name == "exportPdf" {
+        app.run_or_alert("file.exportPdf", build_params(d));
+        return true;
+    }
+    confirm_open_link(app, d)
 }
 
 /// Takes and draws the active dialog, dispatches its body by name, consumes picture-inbox results, runs OK/confirm commands, handles Esc/close and restores the back-dialog stack.
@@ -414,9 +441,9 @@ pub fn show(app: &mut SheetApp, ctx: &egui::Context) {
         app.message = Some((d.title.clone(), "Return to the original worksheet to insert this picture, or cancel and choose another cell.".into()));
         confirm = false;
     }
-    if confirm && d.name == "openLink" {
+    if confirm && has_own_confirm(&d) {
         confirm = false;
-        if confirm_open_link(app, &d) {
+        if confirm_own(app, &d) {
             open = false;
         }
     }
