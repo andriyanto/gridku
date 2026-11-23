@@ -8,14 +8,36 @@ use super::{
 /// Typing `=PY(` doesn't make a Python cell; this says what does.
 pub(crate) const PY_FORMULA: &str = "Python cells are made with the python.set command (the code as `code`), not by typing =PY(…).";
 
-/// Whether typing `input` into a cell enters a formula: `=…`, or `+…`/`-…` followed by a name or
-/// a parenthesis (not a number), as Excel takes `+SUM(1)`.
+/// Whether typing `input` into a cell enters a formula: `=…`, or `+…`/`-…` that isn't a number,
+/// as Excel takes it: followed by a name or a parenthesis (`+SUM(1)`), or a calculation starting
+/// with a number (`+5+6` is 11, `-5*2` is -10; Excel shows `=+5+6` in the formula bar).
 pub(crate) fn is_formula_input(input: &str) -> bool {
-    input.starts_with('=')
-        || (input.len() > 1
-            && (input.starts_with('+') || input.starts_with('-'))
-            && gridcraft_core::parse::parse_number_text(input).is_none()
-            && input.chars().nth(1).is_some_and(|c| c.is_ascii_alphabetic() || c == '('))
+    if input.starts_with('=') {
+        return true;
+    }
+    let mut chars = input.chars();
+    if !matches!(chars.next(), Some('+' | '-')) || gridcraft_core::parse::parse_number_text(input).is_some() {
+        return false;
+    }
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '(' => true,
+        Some(c) if c.is_ascii_digit() || c == '.' => is_calculation(input),
+        _ => false,
+    }
+}
+
+/// Whether `input` (a sign, then a number) reads as a calculation. Two numbers side by side, as in
+/// a phone number (`+62 812 3456`), would be Excel's intersection of two numbers, an error: that
+/// stays text, as does anything that doesn't read as a formula at all (`+5+`).
+fn is_calculation(input: &str) -> bool {
+    let Ok(expr) = gridcraft_formula::parse(input) else { return false };
+    let mut side_by_side = false;
+    expr.walk(&mut |e| {
+        if let gridcraft_formula::Expr::Binary(gridcraft_formula::BinOp::Intersect, ..) = e {
+            side_by_side = true;
+        }
+    });
+    !side_by_side
 }
 
 /// What typing `input` into a cell produces (constant or formula, plus an automatic number
