@@ -938,3 +938,42 @@ fn equations_print_with_the_symbol_font() {
     // A glyph no standard font has is a [?] box.
     assert!(contains(&pdf, "(?) Tj"));
 }
+
+/// File › Export › PDF, Entire workbook as "one file per sheet": each printing sheet is its own
+/// PDF beside the chosen name (`Report - North.pdf`), its pages numbered from 1; a sheet name
+/// with characters a file name can't hold is made safe. Without a path the files come back as
+/// bytes; with one sheet to print, one file is written at the path as before.
+#[test]
+fn export_pdf_split_writes_one_file_per_sheet() {
+    let mut s = Session::new();
+    s.new_workbook();
+    s.execute("cell.set", json!({"cell": "A1", "input": "north"})).unwrap();
+    s.execute("home.insertSheet", json!({"name": "a<b>"})).unwrap();
+    s.execute("sheet.activate", json!({"sheet": "a<b>"})).unwrap();
+    s.execute("cell.set", json!({"cell": "A1", "input": "south"})).unwrap();
+    let dir = std::env::temp_dir().join(format!("gridku-split-pdf-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("Report.pdf").to_string_lossy().into_owned();
+    let r = s.execute("file.exportPdf", json!({"path": path, "sheets": "all", "split": true})).unwrap();
+    let files = r["files"].as_array().unwrap();
+    assert_eq!(files.len(), 2, "{r}");
+    assert_eq!(files[0]["sheet"], "Sheet1");
+    for (f, name) in files.iter().zip(["Report - Sheet1.pdf", "Report - a_b_.pdf"]) {
+        let written = dir.join(name);
+        assert_eq!(f["path"].as_str(), Some(written.to_string_lossy().as_ref()));
+        assert!(std::fs::read(&written).unwrap().starts_with(b"%PDF-"), "{name}");
+        assert_eq!(f["pages"], 1);
+    }
+    assert!(!dir.join("Report.pdf").exists(), "no combined file");
+    // Without a path: the files as bytes, named after the workbook.
+    let r = s.execute("file.exportPdf", json!({"sheets": "all", "split": true})).unwrap();
+    let names: Vec<&str> = r["files"].as_array().unwrap().iter().filter_map(|f| f["name"].as_str()).collect();
+    assert_eq!(names, ["Book1 - Sheet1.pdf", "Book1 - a_b_.pdf"]);
+    assert!(r["files"][0]["base64"].is_string());
+    // One sheet to print: one file at the path.
+    let one = dir.join("One.pdf").to_string_lossy().into_owned();
+    let r = s.execute("file.exportPdf", json!({"path": one, "split": true})).unwrap();
+    assert_eq!(r["path"].as_str(), Some(one.as_str()));
+    let _ = std::fs::remove_dir_all(&dir);
+}
