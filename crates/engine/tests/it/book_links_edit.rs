@@ -343,3 +343,88 @@ fn open_source_opens_the_linked_workbook() {
     assert_eq!(s.active().map(|d| d.display_title()).as_deref(), Some("Budget.xlsx"));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The places other than cells that read a link (the ones Excel's Break Link leaves): a defined
+/// name, a conditional format, data validation and a chart series. `data.linkUses` lists them,
+/// Break Link turns the cells into values and keeps the link while they read it, saying which,
+/// and once they no longer read it Break Link removes the link.
+#[test]
+fn link_uses_finds_names_rules_validation_and_charts_and_break_keeps_their_link() {
+    use std::sync::Arc;
+    let dir = folder("uses");
+    let mut s = report_alone(&dir);
+    s.set_active(0);
+    run(&mut s, "formulas.defineName", json!({"name": "Rate", "refersTo": "=[Budget.xlsx]Sheet1!$A$2"}));
+    run(&mut s, "home.conditionalFormat", json!({"range": "C1:C3", "rule": {"type": "expression", "formula": "=C1>[Budget.xlsx]Sheet1!$A$1"}}));
+    set(&mut s, 0, "E1", "1");
+    set(&mut s, 0, "E2", "2");
+    run(&mut s, "insert.chart", json!({"range": "E1:E2", "type": "column"}));
+    {
+        let wb = Arc::make_mut(&mut s.doc_mut().unwrap().wb);
+        let sheet = wb.sheet_mut(0).unwrap();
+        sheet.validations.push(gridcraft_model::Validation {
+            ranges: vec![gridcraft_core::RangeRef::parse("D1:D4").unwrap()],
+            kind: gridcraft_model::ValidationKind::List,
+            f1: "=[Budget.xlsx]Sheet1!$A$1:$A$2".into(),
+            ..Default::default()
+        });
+        sheet.charts[0].series[0].values = "[Budget.xlsx]Sheet1!$A$1:$A$2".into();
+    }
+    let u = run(&mut s, "data.linkUses", json!({"link": "Budget.xlsx"}));
+    assert_eq!(
+        u["counts"],
+        json!({"cells": 1, "names": 1, "conditionalFormats": 1, "validations": 1, "charts": 1, "sparklines": 0, "pivots": 0}),
+        "{u}"
+    );
+    let kinds: Vec<&str> = u["places"].as_array().unwrap().iter().filter_map(|p| p["kind"].as_str()).collect();
+    assert_eq!(kinds, ["cell", "name", "conditionalFormat", "validation", "chart"]);
+    assert_eq!((u["places"][0]["sheet"].as_str(), u["places"][0]["range"].as_str()), (Some("Sheet1"), Some("B1")));
+    assert_eq!(u["places"][2]["range"], "C1:C3");
+
+    let r = run(&mut s, "data.breakLink", json!({"link": "Budget.xlsx"}));
+    assert_eq!(r["cells"], 1);
+    assert_eq!(r["names"], json!(["Rate"]));
+    assert_eq!(r["kept"], json!({"names": 1, "conditionalFormats": 1, "validations": 1, "charts": 1, "sparklines": 0, "pivots": 0}));
+    assert_eq!(links(&mut s, 0).len(), 1, "the link stays while they read it");
+    assert_eq!((formula(&s, 0, "B1"), value(&s, 0, "B1")), (String::new(), Value::Number(20.0)));
+
+    // Once nothing else reads it, the link goes.
+    {
+        let wb = Arc::make_mut(&mut s.doc_mut().unwrap().wb);
+        wb.names.clear();
+        let sheet = wb.sheet_mut(0).unwrap();
+        sheet.cond_formats.clear();
+        sheet.validations.clear();
+        sheet.charts.clear();
+    }
+    let u = run(&mut s, "data.linkUses", json!({"link": "Budget.xlsx"}));
+    assert_eq!(u["places"], json!([]), "a link read nowhere");
+    let r = run(&mut s, "data.breakLink", json!({"link": "Budget.xlsx"}));
+    assert_eq!(r["kept"]["names"], 0);
+    assert!(links(&mut s, 0).is_empty());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Break All breaks every link in one Undo step.
+#[test]
+fn break_all_breaks_every_link_as_one_undo_step() {
+    let dir = folder("all");
+    let (first, second) = (path(&dir, &["First.xlsx"]), path(&dir, &["Second.xlsx"]));
+    saved_book(&first, 1);
+    saved_book(&second, 5);
+    let mut s = Session::new();
+    run(&mut s, "file.open", json!({"path": first}));
+    run(&mut s, "file.open", json!({"path": second}));
+    run(&mut s, "file.new", json!({}));
+    set(&mut s, 2, "B1", "=[First.xlsx]Sheet1!A1");
+    set(&mut s, 2, "B2", "=[Second.xlsx]Sheet1!A1");
+    assert_eq!(links(&mut s, 2).len(), 2);
+    let r = run(&mut s, "data.breakLink", json!({"all": true}));
+    assert_eq!(r["cells"], 2);
+    assert!(links(&mut s, 2).is_empty());
+    assert_eq!((formula(&s, 2, "B1"), value(&s, 2, "B2")), (String::new(), Value::Number(5.0)));
+    run(&mut s, "edit.undo", json!({}));
+    assert_eq!(links(&mut s, 2).len(), 2);
+    assert_eq!(formula(&s, 2, "B2"), "[Second.xlsx]Sheet1!A1");
+    let _ = std::fs::remove_dir_all(&dir);
+}

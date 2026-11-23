@@ -6,12 +6,18 @@
 //! is open ([`crate::book_links`]). The commands here are for the ones that are not: the list
 //! says which they are, Change Source points the formulas at another workbook, and Break Link
 //! leaves their values and takes the formulas away.
+//!
+//! A link is not only read by cell formulas: defined names, conditional formats, data
+//! validation, chart series, sparklines and PivotTable sources can read it too, and Excel's
+//! Break Link leaves those (the "links that won't break"). `data.linkUses` lists every place
+//! that reads a link, so each can be found and fixed; Break Link turns the cell formulas into
+//! values and keeps the link while any other place still reads it, saying which.
 
 use std::sync::Arc;
 
 use gridcraft_core::{CellRef, RangeRef, Value};
 use gridcraft_formula::{SheetSel, same_name};
-use gridcraft_model::{Formula, Workbook};
+use gridcraft_model::{CfRule, CfValueKind, ExternalLink, Formula, Visibility, Workbook};
 use serde_json::{Value as Json, json};
 
 use crate::cmd::{CommandSpec, bad, cmd, edit, has_doc, str_param};
@@ -19,6 +25,8 @@ use crate::{EngineError, Result, Session};
 
 /// Most values Break Link writes for the results of formulas that fill many cells.
 const MAX_BROKEN_VALUES: u64 = 2_000_000;
+/// Most places `data.linkUses` lists for one link (all are counted).
+const MAX_LISTED_USES: usize = 10_000;
 
 pub(super) fn specs() -> Vec<CommandSpec> {
     vec![
@@ -55,9 +63,18 @@ pub(super) fn specs() -> Vec<CommandSpec> {
             "Break Link",
             ["Data", "Queries & Connections"],
             None,
-            "{link} → {cells, names: [defined names that still read it]}: the formulas that read the workbook become their values",
+            "{link | all: true} → {cells, names: [defined names that still read it], kept: {names, conditionalFormats, validations, charts, sparklines, pivots}, links: [links kept]}: the cell formulas that read the workbook (or every linked workbook) become their values; the link stays while another place still reads it",
             has_doc,
             break_link
+        ),
+        cmd!(
+            query "data.linkUses",
+            "Find Link",
+            ["Data", "Queries & Connections"],
+            None,
+            "{link} → {places: [{kind: \"cell\" | \"name\" | \"conditionalFormat\" | \"validation\" | \"chart\" | \"sparkline\" | \"pivot\", sheet?, range?, name?, id?, hidden?}], more, counts: {cells, names, conditionalFormats, validations, charts, sparklines, pivots}}: every place that reads the linked workbook, in order (none: the link is read nowhere)",
+            has_doc,
+            link_uses
         ),
     ]
 }
@@ -211,70 +228,240 @@ fn open_source(s: &mut Session, p: &Json) -> Result<Json> {
     Ok(json!({"path": path}))
 }
 
-/// Whether `formula` reads the workbook `book`.
-fn reads(formula: &Formula, book: &str) -> bool {
+/// Whether the cell formula `formula` reads `link` (its parsed form is kept, so this is cheap).
+fn reads(formula: &Formula, link: &ExternalLink) -> bool {
     crate::book_links::may_read(&formula.text)
         && formula
             .with_expr(|e| {
                 let mut found = Vec::new();
                 gridcraft_formula::adjust::external_refs(e, &mut found);
-                found.iter().any(|(b, _, _)| same_name(b, book))
+                found.iter().any(|(b, _, _)| is_link(b, link))
             })
             .unwrap_or(false)
 }
 
+/// Whether `book`, as a formula names it between the brackets, is `link`: by its name, or by
+/// its number in the file it came from (`[1]`).
+fn is_link(book: &str, link: &ExternalLink) -> bool {
+    same_name(book, &link.name) || link.number.is_some_and(|n| book == n.to_string())
+}
+
+/// Whether formula text (with or without its `=`) reads `link`.
+fn text_reads(text: &str, link: &ExternalLink) -> bool {
+    let t = text.trim();
+    let t = t.strip_prefix('=').unwrap_or(t);
+    if !crate::book_links::may_read(t) {
+        return false;
+    }
+    let Ok(e) = gridcraft_formula::parse(t).or_else(|_| gridcraft_formula::parse_name(t)) else { return false };
+    let mut found = Vec::new();
+    gridcraft_formula::adjust::external_refs(&e, &mut found);
+    found.iter().any(|(b, _, _)| is_link(b, link))
+}
+
+/// The formula texts a conditional format holds: comparison values, its rule's formula, and
+/// thresholds given as formulas.
+fn cf_texts(rule: &CfRule) -> Vec<&str> {
+    fn kind(k: &CfValueKind) -> Option<&str> {
+        match k {
+            CfValueKind::Formula(f) => Some(f.as_str()),
+            _ => None,
+        }
+    }
+    match rule {
+        CfRule::CellIs { a, b, .. } => std::iter::once(a.as_str()).chain(b.as_deref()).collect(),
+        CfRule::Expression { formula, .. } => vec![formula.as_str()],
+        CfRule::ColorScale { stops } => stops.iter().filter_map(|(k, _)| kind(k)).collect(),
+        CfRule::DataBar { min, max, .. } => [min, max].into_iter().filter_map(kind).collect(),
+        CfRule::IconSet { thresholds, .. } => thresholds.iter().filter_map(kind).collect(),
+        _ => vec![],
+    }
+}
+
+/// Every place of a workbook that reads one link, counted by kind.
+#[derive(Default)]
+struct Uses {
+    places: Vec<Json>,
+    more: bool,
+    cells: u64,
+    names: Vec<String>,
+    conditional_formats: u64,
+    validations: u64,
+    charts: u64,
+    sparklines: u64,
+    pivots: u64,
+}
+
+impl Uses {
+    fn add(&mut self, place: Json) {
+        if self.places.len() < MAX_LISTED_USES {
+            self.places.push(place);
+        } else {
+            self.more = true;
+        }
+    }
+
+    /// Places Break Link does not turn into values.
+    fn others(&self) -> u64 {
+        self.conditional_formats + self.validations + self.charts + self.sparklines + self.pivots
+    }
+
+    fn kept(&self) -> Json {
+        json!({
+            "names": self.names.len(),
+            "conditionalFormats": self.conditional_formats,
+            "validations": self.validations,
+            "charts": self.charts,
+            "sparklines": self.sparklines,
+            "pivots": self.pivots,
+        })
+    }
+
+    fn counts(&self) -> Json {
+        let mut c = self.kept();
+        c["cells"] = json!(self.cells);
+        c
+    }
+}
+
+/// The places of `wb` that read `link`: cells sheet by sheet, then defined names, then per
+/// sheet its conditional formats, data validation, charts, sparklines and PivotTables.
+fn uses_of(wb: &Workbook, link: &ExternalLink) -> Uses {
+    let mut u = Uses::default();
+    for sheet in &wb.sheets {
+        let hidden = sheet.visibility != Visibility::Visible;
+        for (c, cell) in sheet.cells.iter() {
+            if cell.formula.as_deref().is_some_and(|f| reads(f, link)) {
+                u.cells += 1;
+                u.add(json!({"kind": "cell", "sheet": sheet.name, "range": c.a1(), "hidden": hidden}));
+            }
+        }
+    }
+    for n in wb.names.iter().filter(|n| text_reads(&n.formula, link)) {
+        u.names.push(n.name.clone());
+        let scope = n.scope.and_then(|i| wb.sheet(i)).map(|s| s.name.clone());
+        u.add(json!({"kind": "name", "name": n.name, "sheet": scope, "hidden": n.hidden}));
+    }
+    let a1 = |ranges: &[RangeRef]| ranges.iter().map(RangeRef::a1).collect::<Vec<_>>().join(",");
+    for sheet in &wb.sheets {
+        let hidden = sheet.visibility != Visibility::Visible;
+        for (i, cf) in sheet.cond_formats.iter().enumerate() {
+            if cf_texts(&cf.rule).into_iter().any(|t| text_reads(t, link)) {
+                u.conditional_formats += 1;
+                u.add(json!({"kind": "conditionalFormat", "sheet": sheet.name, "range": a1(&cf.ranges), "index": i, "hidden": hidden}));
+            }
+        }
+        for (i, v) in sheet.validations.iter().enumerate() {
+            if std::iter::once(v.f1.as_str()).chain(v.f2.as_deref()).any(|t| text_reads(t, link)) {
+                u.validations += 1;
+                u.add(json!({"kind": "validation", "sheet": sheet.name, "range": a1(&v.ranges), "index": i, "hidden": hidden}));
+            }
+        }
+        for chart in &sheet.charts {
+            let series =
+                chart.series.iter().flat_map(|s| [s.name.as_deref(), s.categories.as_deref(), Some(s.values.as_str()), s.bubble_sizes.as_deref()]);
+            if series.chain([chart.title.as_deref()]).flatten().any(|t| text_reads(t, link)) {
+                u.charts += 1;
+                u.add(json!({"kind": "chart", "sheet": sheet.name, "id": chart.id, "name": chart.title, "hidden": hidden}));
+            }
+        }
+        for sp in sheet.sparklines.iter().filter(|sp| text_reads(&sp.source, link)) {
+            u.sparklines += 1;
+            u.add(json!({"kind": "sparkline", "sheet": sheet.name, "range": sp.cell.a1(), "hidden": hidden}));
+        }
+        for pivot in sheet.pivots.iter().filter(|p| text_reads(&p.source, link)) {
+            u.pivots += 1;
+            let range = pivot.last_range.unwrap_or(RangeRef::cell(pivot.anchor));
+            u.add(json!({"kind": "pivot", "sheet": sheet.name, "name": pivot.name, "range": range.a1(), "hidden": hidden}));
+        }
+    }
+    u
+}
+
+fn link_uses(s: &mut Session, p: &Json) -> Result<Json> {
+    let name = link_param(s, p, "data.linkUses")?;
+    let wb = &s.doc()?.wb;
+    let Some(link) = gridcraft_model::links::find(&wb.links, &name) else { return Ok(json!({"places": [], "more": false})) };
+    let u = uses_of(wb, link);
+    Ok(json!({"places": u.places, "more": u.more, "counts": u.counts()}))
+}
+
+/// Turns the cell formulas of `cx` that read `name` into their values. Returns how many
+/// formulas there were.
+fn break_cells(cx: &mut crate::cmd::Ctx, name: &str, written: &mut u64) -> Result<u64> {
+    const ID: &str = "data.breakLink";
+    let Some(link) = gridcraft_model::links::find(&cx.wb.links, name).cloned() else { return Ok(0) };
+    let mut cells = 0u64;
+    for si in 0..cx.wb.sheets.len() {
+        let Some(sheet) = cx.wb.sheet(si) else { continue };
+        // Each formula that reads the workbook, with the cells its result fills.
+        let found: Vec<(CellRef, Option<RangeRef>)> = sheet
+            .cells
+            .iter()
+            .filter(|(_, cell)| cell.formula.as_deref().is_some_and(|f| reads(f, &link)))
+            .map(|(c, _)| (c, sheet.spill_ranges.get(&c).copied().filter(|r| !r.is_single())))
+            .collect();
+        let mut values: Vec<(CellRef, Value)> = Vec::new();
+        for (c, spill) in found {
+            cells += 1;
+            let range = spill.unwrap_or(RangeRef::cell(c));
+            *written = written.saturating_add(range.count());
+            if *written > MAX_BROKEN_VALUES {
+                return Err(bad(ID, format!("the formulas that read \"{name}\" fill more than {MAX_BROKEN_VALUES} cells")));
+            }
+            for row in range.start.row..=range.end.row {
+                for col in range.start.col..=range.end.col {
+                    let at = CellRef::new(row, col);
+                    values.push((at, sheet.value(at)));
+                }
+            }
+        }
+        let sheet = cx.sheet_mut(si)?;
+        for (at, value) in values {
+            sheet.set_value(at, value);
+        }
+    }
+    Ok(cells)
+}
+
 fn break_link(s: &mut Session, p: &Json) -> Result<Json> {
     const ID: &str = "data.breakLink";
-    let name = link_param(s, p, ID)?;
+    let all = p.get("all").and_then(Json::as_bool).unwrap_or(false);
+    let targets: Vec<String> = if all { s.doc()?.wb.links.iter().map(|l| l.name.clone()).collect() } else { vec![link_param(s, p, ID)?] };
     edit(s, |cx| {
         let mut cells = 0u64;
         let mut written = 0u64;
-        for si in 0..cx.wb.sheets.len() {
-            let Some(sheet) = cx.wb.sheet(si) else { continue };
-            // Each formula that reads the workbook, with the cells its result fills.
-            let found: Vec<(CellRef, Option<RangeRef>)> = sheet
-                .cells
-                .iter()
-                .filter(|(_, cell)| cell.formula.as_deref().is_some_and(|f| reads(f, &name)))
-                .map(|(c, _)| (c, sheet.spill_ranges.get(&c).copied().filter(|r| !r.is_single())))
-                .collect();
-            let mut values: Vec<(CellRef, Value)> = Vec::new();
-            for (c, spill) in found {
-                cells += 1;
-                let range = spill.unwrap_or(RangeRef::cell(c));
-                written = written.saturating_add(range.count());
-                if written > MAX_BROKEN_VALUES {
-                    return Err(bad(ID, format!("the formulas that read \"{name}\" fill more than {MAX_BROKEN_VALUES} cells")));
-                }
-                for row in range.start.row..=range.end.row {
-                    for col in range.start.col..=range.end.col {
-                        let at = CellRef::new(row, col);
-                        values.push((at, sheet.value(at)));
-                    }
+        let mut names: Vec<String> = Vec::new();
+        let mut kept: Vec<Json> = Vec::new();
+        let mut totals = Uses::default();
+        for name in &targets {
+            cells += break_cells(cx, name, &mut written)?;
+            // What still reads the workbook keeps the link, as it still needs its values: a
+            // defined name is not a value, and conditional formats, data validation, charts,
+            // sparklines and PivotTables are left for a person to change (as in Excel).
+            let Some(at) = cx.wb.links.iter().position(|l| same_name(&l.name, name)) else { continue };
+            let Some(link) = cx.wb.links.get(at).cloned() else { continue };
+            let u = uses_of(&cx.wb, &link);
+            if u.names.is_empty() && u.others() == 0 {
+                drop_link(&mut cx.wb, at);
+                continue;
+            }
+            for n in &u.names {
+                if !names.contains(n) {
+                    names.push(n.clone());
                 }
             }
-            let sheet = cx.sheet_mut(si)?;
-            for (at, value) in values {
-                sheet.set_value(at, value);
-            }
-        }
-        // A defined name is not a value: one that reads the workbook stays, and the link with
-        // it, as the name still needs its values.
-        let reading = |formula: &str| {
-            crate::book_links::may_read(formula)
-                && gridcraft_formula::parse_name(formula).is_ok_and(|e| {
-                    let mut found = Vec::new();
-                    gridcraft_formula::adjust::external_refs(&e, &mut found);
-                    found.iter().any(|(b, _, _)| same_name(b, &name))
-                })
-        };
-        let names: Vec<String> = cx.wb.names.iter().filter(|n| reading(&n.formula)).map(|n| n.name.clone()).collect();
-        if names.is_empty()
-            && let Some(at) = cx.wb.links.iter().position(|l| same_name(&l.name, &name))
-        {
-            drop_link(&mut cx.wb, at);
+            kept.push(json!({"name": name, "kept": u.kept()}));
+            totals.names.extend(u.names);
+            totals.conditional_formats += u.conditional_formats;
+            totals.validations += u.validations;
+            totals.charts += u.charts;
+            totals.sparklines += u.sparklines;
+            totals.pivots += u.pivots;
         }
         cx.structural = true;
-        Ok(json!({"cells": cells, "names": names}))
+        let mut kept_counts = totals.kept();
+        kept_counts["names"] = json!(names.len());
+        Ok(json!({"cells": cells, "names": names, "kept": kept_counts, "links": kept}))
     })
 }
