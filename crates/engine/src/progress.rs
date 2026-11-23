@@ -10,6 +10,10 @@ use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 /// What the command is doing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Phase {
+    /// Connecting to a database server.
+    Connecting,
+    /// Counting the rows to read.
+    CountingRows,
     /// Reading rows from a database.
     ReadingRows,
     /// Putting rows in the sheet.
@@ -20,15 +24,24 @@ impl Phase {
     /// What the interface says it is doing.
     pub fn label(self) -> &'static str {
         match self {
+            Phase::Connecting => "Connecting",
+            Phase::CountingRows => "Counting rows",
             Phase::ReadingRows => "Reading rows",
             Phase::WritingRows => "Writing rows",
         }
+    }
+
+    /// Whether the phase has a count to show (else the bar runs back and forth).
+    pub fn counts(self) -> bool {
+        matches!(self, Phase::ReadingRows | Phase::WritingRows)
     }
 
     fn code(self) -> u8 {
         match self {
             Phase::ReadingRows => 1,
             Phase::WritingRows => 2,
+            Phase::Connecting => 3,
+            Phase::CountingRows => 4,
         }
     }
 
@@ -36,6 +49,8 @@ impl Phase {
         match c {
             1 => Some(Phase::ReadingRows),
             2 => Some(Phase::WritingRows),
+            3 => Some(Phase::Connecting),
+            4 => Some(Phase::CountingRows),
             _ => None,
         }
     }

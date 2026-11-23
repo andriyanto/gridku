@@ -7,7 +7,7 @@ use std::time::Instant;
 use rusqlite::types::ValueRef;
 use rusqlite::{Connection, ErrorCode, OpenFlags};
 
-use crate::{ColumnInfo, DbError, DbValue, Limits, ObjectInfo, ObjectKind, RowKey, Stop, TableData, split_type};
+use crate::{ColumnInfo, DbError, DbValue, Limits, ObjectInfo, ObjectKind, RowKey, Step, Stop, TableData, split_type};
 
 /// SQLite's own error as ours. An interrupted statement was cancelled, or ran out of time.
 fn db_err(e: rusqlite::Error, limits: Option<&Limits>) -> DbError {
@@ -113,13 +113,7 @@ fn cut(text: &str, max: usize, cut_texts: &mut usize) -> String {
     }
 }
 
-pub(crate) fn read(
-    path: &str,
-    table: &str,
-    limits: Limits,
-    stop: Option<Stop>,
-    progress: &mut dyn FnMut(usize, usize),
-) -> Result<TableData, DbError> {
+pub(crate) fn read(path: &str, table: &str, limits: Limits, stop: Option<Stop>, progress: &mut dyn FnMut(Step)) -> Result<TableData, DbError> {
     let stopped = |s: &Option<Stop>| s.as_ref().is_some_and(|f| f());
     let cancelled = |e: DbError, s: &Option<Stop>| if stopped(s) { DbError::Cancelled } else { e };
     let mut conn = open(path)?;
@@ -151,11 +145,12 @@ pub(crate) fn read(
     let width = columns.len().max(1);
     let max_rows = limits.max_rows.min(limits.max_cells / width);
     // How many rows there are, for the progress (at most the rows read).
+    progress(Step::Counting);
     let count: i64 = conn
         .query_row(&format!("SELECT count(*) FROM {}", quote(table)), [], |r| r.get(0))
         .map_err(|e| cancelled(db_err(e, Some(&limits)), &stop))?;
     let total = usize::try_from(count).unwrap_or(0).min(max_rows);
-    progress(0, total);
+    progress(Step::Rows { done: 0, total });
     let mut st = conn.prepare(&query).map_err(|e| cancelled(db_err(e, Some(&limits)), &stop))?;
     let mut rows = st.query([]).map_err(|e| cancelled(db_err(e, Some(&limits)), &stop))?;
     let offset = usize::from(alias.is_some());
@@ -169,7 +164,7 @@ pub(crate) fn read(
             if stopped(&stop) {
                 return Err(DbError::Cancelled);
             }
-            progress(out.len(), total.max(out.len()));
+            progress(Step::Rows { done: out.len(), total: total.max(out.len()) });
         }
         if alias.is_some() {
             rowids.push(row.get::<_, i64>(0).map_err(|e| db_err(e, Some(&limits)))?);
@@ -187,7 +182,7 @@ pub(crate) fn read(
         }
         out.push(values);
     }
-    progress(out.len(), out.len());
+    progress(Step::Rows { done: out.len(), total: out.len() });
     Ok(TableData { columns, rows: out, key, rowids, truncated, cut_texts })
 }
 
@@ -230,7 +225,7 @@ mod tests {
     ";
 
     fn read_all(path: &str, table: &str, limits: Limits) -> Result<TableData, DbError> {
-        read(path, table, limits, None, &mut |_, _| {})
+        read(path, table, limits, None, &mut |_| {})
     }
 
     #[test]
@@ -302,12 +297,17 @@ mod tests {
         sql.push_str("WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 2500) INSERT INTO big SELECT x FROM c;");
         let db = TempDb::new("progress", &sql);
         let mut seen = Vec::new();
-        let t = read(db.path(), "big", Limits::default(), None, &mut |done, total| seen.push((done, total))).unwrap();
+        let t = read(db.path(), "big", Limits::default(), None, &mut |step| {
+            if let Step::Rows { done, total } = step {
+                seen.push((done, total))
+            }
+        })
+        .unwrap();
         assert_eq!(t.rows.len(), 2500);
         assert_eq!(seen, [(0, 2500), (1000, 2500), (2000, 2500), (2500, 2500)]);
         // Asked to stop: it stops, whatever it was doing.
         let stop: Stop = std::sync::Arc::new(|| true);
-        assert!(matches!(read(db.path(), "big", Limits::default(), Some(stop), &mut |_, _| {}), Err(DbError::Cancelled)));
+        assert!(matches!(read(db.path(), "big", Limits::default(), Some(stop), &mut |_| {}), Err(DbError::Cancelled)));
     }
 
     #[test]

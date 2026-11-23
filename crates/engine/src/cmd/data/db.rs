@@ -24,7 +24,7 @@
 use std::sync::Arc;
 
 use gridcraft_core::{CellRef, RangeRef, Value};
-use gridcraft_db::{ColumnInfo, DbError, DbValue, Limits, PgConfig, RowKey, SslMode, TableData};
+use gridcraft_db::{ColumnInfo, DbError, DbValue, Limits, PgConfig, RowKey, SslMode, Step, TableData};
 use gridcraft_model::{DbColumn, DbEngine, DbRowKey, DbSource};
 use serde_json::{Value as Json, json};
 
@@ -364,7 +364,11 @@ fn read(s: &Session, conn: &Conn, schema: Option<&str>, table: &str) -> Result<T
     let interrupt = s.interrupt();
     let stop: gridcraft_db::Stop = Arc::new(move || interrupt.is_requested());
     let progress = s.progress();
-    let mut report = |done: usize, total: usize| progress.report(Phase::ReadingRows, done as u64, total as u64);
+    let mut report = |step: Step| match step {
+        Step::Connecting => progress.report(Phase::Connecting, 0, 0),
+        Step::Counting => progress.report(Phase::CountingRows, 0, 0),
+        Step::Rows { done, total } => progress.report(Phase::ReadingRows, done as u64, total as u64),
+    };
     let data = match conn {
         Conn::Sqlite(path) => gridcraft_db::sqlite_read(path, table, Limits::default(), Some(stop), &mut report),
         Conn::Pg(cfg) => gridcraft_db::pg_read(cfg, schema.unwrap_or("public"), table, Limits::default(), Some(stop), &mut report),

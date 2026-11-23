@@ -1,6 +1,6 @@
 # Databases: Data › DB Connect
 
-> **Last reviewed:** 2026-11-24 · **Last updated:** 2026-11-24 · **Change:** minor (stage 2: PostgreSQL; earlier: a progress bar and Cancel while a large table loads; earlier: a loaded table's source is saved in the XLSX file; earlier: created, stage 1, reading SQLite) · **Target:** beyond Excel (Excel reads databases through Get Data and ODBC and never writes back)
+> **Last reviewed:** 2026-11-24 · **Last updated:** 2026-11-24 · **Change:** minor (waiting for a server shows what is happening, with Cancel; earlier: stage 2: PostgreSQL; earlier: a progress bar and Cancel while a large table loads; earlier: a loaded table's source is saved in the XLSX file; earlier: created, stage 1, reading SQLite) · **Target:** beyond Excel (Excel reads databases through Get Data and ODBC and never writes back)
 
 GridKu reads tables from a database into sheets, and later will write changes back. This page
 records the design of the first stage and what it keeps for the next ones.
@@ -106,12 +106,17 @@ lists them through `app.commands`).
    it (`postgresql://user@host:5432/db?sslmode=prefer`), so the saved file has none; Refresh of
    a table whose server the pane isn't connected to (a workbook opened from a file) asks for it
    in a **Database Password** box.
+14. **Waiting.** Connect and Table Information… run on their own thread, so the window never
+   waits for a server: the pane shows a spinner and what it is doing (**Connecting to
+   localhost…**, **Opening toko.db…**, **Reading the fields of pelanggan…**) with a
+   **Cancel** button, which drops the answer when it comes; Connect, Load and Refresh are off
+   meanwhile. In the busy box of Load and Refresh, **Connecting…** and **Counting rows…** come
+   before the counted phases, with a bar that moves back and forth because nothing can be
+   counted yet; Cancel works in every phase.
 
 ## Not yet
 
 - Writing back (stage 3).
-- Connecting to PostgreSQL and listing its tables happen while the window waits (up to the
-  15-second connect limit); Load and Refresh run in the background.
 - Materialized views and foreign tables other than those `information_schema` lists.
 
 ## Testing against PostgreSQL
@@ -138,6 +143,7 @@ CREATE VIEW public.aktif AS SELECT nama FROM public.pelanggan WHERE aktif;
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-11-24 | minor | Connect and Table Information run in the background with a spinner, the step in words and Cancel in the pane; Load and Refresh say Connecting… and Counting rows… with a moving bar before the counted phases |
 | 2026-11-24 | minor | Stage 2: PostgreSQL in DB Connect (host, port, database, user, password, SSL); tables and views schema by schema, Table Information, Load and Refresh; read-only sessions over TLS with the system's certificate authorities; the password asked for each time and never kept |
 | 2026-11-24 | minor | Loading or refreshing a large table shows Reading rows… then Writing rows… with a progress bar and the count in the busy box; Cancel stops it in either phase and nothing changes |
 | 2026-11-24 | minor | A loaded table's source is saved in the XLSX file as a custom XML part (which Excel keeps), the database file relative to the workbook; opened again, Refresh and Load find it |

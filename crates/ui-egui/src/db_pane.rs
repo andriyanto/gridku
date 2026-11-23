@@ -9,9 +9,15 @@
 //! table at the active cell (`data.dbRefresh`). A large table loads in the background: the busy
 //! box shows the rows read, then written, as a progress bar, and Cancel stops it.
 //!
+//! Connecting (reading the list) and Table Information run off the interface thread, so the window
+//! stays alive while a server answers (up to the 15-second connect limit): the pane shows what it
+//! waits for with a spinner and Cancel, which drops the answer.
+//!
 //! A PostgreSQL password is held only in this pane's memory while it is connected (egui's
 //! temporary memory, never saved), and asked for again on the next Connect; a table loaded
 //! earlier, or in a workbook opened from a file, asks for it when it is refreshed.
+
+use std::sync::{Arc, Mutex};
 
 use egui::{RichText, Ui};
 use serde_json::{Value as Json, json};
@@ -39,6 +45,53 @@ impl TableRef {
     }
 }
 
+/// The answer of a query run off the interface thread, once it is there.
+type Slot = Arc<Mutex<Option<Result<Json, String>>>>;
+
+/// What a query the pane waits for is for.
+#[derive(Clone, Debug)]
+enum Query {
+    /// The list of tables, read with these connection parameters.
+    List(Json),
+    /// A table's fields (Table Information).
+    Info(TableRef),
+}
+
+/// A query the pane waits for: what for, what it says meanwhile, and where the answer comes.
+#[derive(Clone, Debug)]
+struct Waiting {
+    query: Query,
+    label: String,
+    slot: Slot,
+}
+
+/// Runs engine command `id` (a query that needs no workbook of the person's) on a thread of its
+/// own, in a session of its own, and puts the answer in the slot it returns. On the web, which
+/// has no threads, it runs here.
+fn spawn_query(ctx: &egui::Context, id: &'static str, params: Json) -> Slot {
+    let slot: Slot = Arc::new(Mutex::new(None));
+    let out = Arc::clone(&slot);
+    let ctx = ctx.clone();
+    let run = move || {
+        let mut s = gridcraft_engine::Session::new();
+        s.new_workbook();
+        let r = s.execute(id, params).map_err(|e| e.to_string());
+        if let Ok(mut answer) = out.lock() {
+            *answer = Some(r);
+        }
+        ctx.request_repaint();
+    };
+    #[cfg(not(target_arch = "wasm32"))]
+    if std::thread::Builder::new().name("gridku-db".into()).spawn(run).is_err()
+        && let Ok(mut answer) = slot.lock()
+    {
+        *answer = Some(Err("The database couldn't be reached: no thread could be started for it.".into()));
+    }
+    #[cfg(target_arch = "wasm32")]
+    run();
+    slot
+}
+
 /// What the pane remembers between frames (egui's memory, by the pane's id; never saved).
 #[derive(Clone, Debug)]
 struct PaneState {
@@ -58,6 +111,8 @@ struct PaneState {
     error: Option<String>,
     /// Table Information: the table and its columns, while the window is open.
     info: Option<(String, Vec<Json>)>,
+    /// The query the pane waits for (connecting, a table's fields).
+    waiting: Option<Waiting>,
 }
 
 impl Default for PaneState {
@@ -76,6 +131,7 @@ impl Default for PaneState {
             selected: None,
             error: None,
             info: None,
+            waiting: None,
         }
     }
 }
@@ -128,8 +184,8 @@ fn state_id() -> egui::Id {
     egui::Id::unique("db_connect_pane")
 }
 
-/// Reads the database's tables and views into the list.
-fn list(app: &mut SheetApp, st: &mut PaneState) {
+/// Starts reading the database's tables and views into the list (off the interface thread).
+fn list(ctx: &egui::Context, st: &mut PaneState) {
     st.selected = None;
     st.tables.clear();
     st.error = None;
@@ -138,8 +194,29 @@ fn list(app: &mut SheetApp, st: &mut PaneState) {
         return;
     }
     let conn = st.conn();
-    match app.engine("data.dbTables", conn.clone()) {
-        Ok(r) => {
+    let label = match st.engine.as_str() {
+        "postgresql" => format!("Connecting to {}…", st.host.trim()),
+        _ => {
+            let path = st.path.trim();
+            let file = std::path::Path::new(path).file_name().map_or_else(|| path.to_string(), |f| f.to_string_lossy().into_owned());
+            format!("Opening {file}…")
+        }
+    };
+    let slot = spawn_query(ctx, "data.dbTables", conn.clone());
+    st.waiting = Some(Waiting { query: Query::List(conn), label, slot });
+}
+
+/// Takes the answer of the query waited for, when it is there.
+fn take_answer(app: &mut SheetApp, st: &mut PaneState) {
+    let Some(w) = &st.waiting else { return };
+    let answer = match w.slot.lock() {
+        Ok(mut a) => a.take(),
+        Err(_) => Some(Err("The database query stopped unexpectedly.".into())),
+    };
+    let Some(answer) = answer else { return };
+    let Some(w) = st.waiting.take() else { return };
+    match (w.query, answer) {
+        (Query::List(conn), Ok(r)) => {
             st.tables = r["tables"]
                 .as_array()
                 .into_iter()
@@ -152,8 +229,27 @@ fn list(app: &mut SheetApp, st: &mut PaneState) {
                 .collect();
             st.connected = Some(conn);
         }
-        Err(e) => st.error = Some(crate::clean_error(&e)),
+        (Query::List(_), Err(e)) => st.error = Some(crate::clean_error(&e)),
+        (Query::Info(t), Ok(r)) => {
+            let title = t.schema.as_ref().filter(|s| *s != "public").map_or_else(|| t.name.clone(), |s| format!("{s}.{}", t.name));
+            st.info = Some((title, r["columns"].as_array().cloned().unwrap_or_default()));
+        }
+        (Query::Info(_), Err(e)) => app.message = Some(("Table Information".into(), crate::clean_error(&e))),
     }
+}
+
+/// While a query is waited for: what for, a spinner and Cancel (which drops its answer).
+fn waiting_row(ui: &mut Ui, st: &mut PaneState) {
+    let Some(w) = &st.waiting else { return };
+    let label = w.label.clone();
+    ui.horizontal(|ui| {
+        ui.spinner();
+        ui.label(label);
+        if ui.button("Cancel").clicked() {
+            st.waiting = None;
+        }
+    });
+    ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
 }
 
 /// The sheet table at the active cell, when it was loaded from a database: its name, and the
@@ -285,7 +381,9 @@ fn tables_and_views(ui: &mut Ui, st: &mut PaneState, schema: Option<&str>, info_
 
 pub(crate) fn pane(app: &mut SheetApp, ui: &mut Ui) {
     let mut st: PaneState = ui.data_mut(|d| d.get_temp(state_id())).unwrap_or_default();
+    take_answer(app, &mut st);
     let t = Tokens::get(ui.ctx());
+    let idle = st.waiting.is_none();
 
     // Top: the engine and the database.
     ui.label(RichText::new("Database engine").strong());
@@ -304,14 +402,17 @@ pub(crate) fn pane(app: &mut SheetApp, ui: &mut Ui) {
     ui.add_space(6.0);
     let mut read = if st.engine == "postgresql" { postgres_fields(ui, &mut st) } else { sqlite_fields(app, ui, &mut st) };
     ui.horizontal(|ui| {
-        read |= ui.add_enabled(st.can_connect(), egui::Button::new("Connect")).clicked();
-        if st.connected.is_some() && ui.button("Reload List").on_hover_text("Reads the database's tables again").clicked() {
+        read |= ui.add_enabled(idle && st.can_connect(), egui::Button::new("Connect")).clicked();
+        if st.connected.is_some()
+            && ui.add_enabled(idle, egui::Button::new("Reload List")).on_hover_text("Reads the database's tables again").clicked()
+        {
             read = true;
         }
     });
-    if read {
-        list(app, &mut st);
+    if read && idle {
+        list(ui.ctx(), &mut st);
     }
+    waiting_row(ui, &mut st);
     if let Some(e) = &st.error {
         ui.label(RichText::new(e).color(t.danger));
     }
@@ -352,27 +453,24 @@ fn tree_and_actions(app: &mut SheetApp, ui: &mut Ui, st: &mut PaneState, t: &Tok
             }
         }
     }
-    if let (Some(t), Some(conn)) = (info_for, st.connected.clone()) {
-        match app.engine("data.dbColumns", t.params(&conn)) {
-            Ok(r) => {
-                let title = t.schema.as_ref().filter(|s| *s != "public").map_or_else(|| t.name.clone(), |s| format!("{s}.{}", t.name));
-                st.info = Some((title, r["columns"].as_array().cloned().unwrap_or_default()));
-            }
-            Err(e) => app.message = Some(("Table Information".into(), crate::clean_error(&e))),
-        }
+    let idle = st.waiting.is_none();
+    if let (Some(t), Some(conn), true) = (info_for, st.connected.clone(), idle) {
+        let slot = spawn_query(ui.ctx(), "data.dbColumns", t.params(&conn));
+        st.waiting = Some(Waiting { label: format!("Reading the fields of {}…", t.name), query: Query::Info(t), slot });
     }
+    let idle = st.waiting.is_none();
     ui.add_space(6.0);
     ui.horizontal(|ui| {
         let load =
             ui.add_enabled(st.selected.is_some(), egui::Button::new("Load")).on_hover_text("Puts the selected table in a new sheet, as a table");
-        if (load.clicked() || load_now)
+        if (load.clicked() || (load_now && idle))
             && let (Some(table), Some(conn)) = (st.selected.clone(), st.connected.clone())
         {
             run_db(app, "data.dbLoad", table.params(&conn));
         }
         let here = loaded_table_here(app);
         let refresh = ui
-            .add_enabled(here.is_some(), egui::Button::new("Refresh"))
+            .add_enabled(idle && here.is_some(), egui::Button::new("Refresh"))
             .on_hover_text("Reads again the database table of the table at the active cell")
             .on_disabled_hover_text("Select a cell in a table loaded from a database");
         if refresh.clicked()
