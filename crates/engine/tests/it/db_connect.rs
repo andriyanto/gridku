@@ -150,3 +150,70 @@ fn a_saved_workbook_keeps_the_table_without_the_database() {
     assert_eq!(sh.tables.len(), 1);
     assert_eq!(sh.value(CellRef::parse("B3").unwrap()), Value::text("Budi"));
 }
+
+/// The names of the parts of an XLSX package, and one part's text.
+fn zip_parts(bytes: &[u8]) -> Vec<String> {
+    let z = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+    z.file_names().filter_map(Result::ok).map(|n| n.into_owned()).collect()
+}
+
+fn zip_text(bytes: &[u8], name: &str) -> String {
+    use std::io::Read;
+    let mut z = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+    let mut s = String::new();
+    z.by_name(name).unwrap().read_to_string(&mut s).unwrap();
+    s
+}
+
+/// Saved to a file, a loaded table's source goes in a custom XML part (Excel keeps those), with
+/// the database file relative to the workbook's folder; opened again, the table refreshes from
+/// it, and loading the database table again refreshes it too. Saved again, there is still one
+/// such part.
+#[test]
+fn the_source_is_saved_in_the_file_relative_to_it_and_refreshes_after_opening() {
+    let dir = std::env::temp_dir().join(format!("gridku-dbsave-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("data")).unwrap();
+    let db_path = dir.join("data").join("toko lama.db");
+    rusqlite::Connection::open(&db_path).unwrap().execute_batch(SHOP).unwrap();
+    let book = dir.join("Laporan.xlsx").to_string_lossy().into_owned();
+    let mut s = Session::new();
+    s.new_workbook();
+    run(&mut s, "data.dbLoad", json!({"path": db_path.to_string_lossy(), "table": "orders"}));
+    run(&mut s, "file.saveAs", json!({"path": book}));
+    let bytes = std::fs::read(&book).unwrap();
+    let parts = zip_parts(&bytes);
+    assert!(parts.contains(&"customXml/item1.xml".to_string()), "{parts:?}");
+    assert!(parts.contains(&"customXml/itemProps1.xml".to_string()), "{parts:?}");
+    let item = zip_text(&bytes, "customXml/item1.xml");
+    assert!(item.contains("xmlns=\"urn:gridku:db-sources:1\""), "{item}");
+    assert!(item.contains("location=\"data/toko%20lama.db\""), "relative to the workbook: {item}");
+    assert!(!item.contains(&dir.to_string_lossy().to_string()), "no folder above the workbook's: {item}");
+    assert!(item.contains("<column name=\"customer\" type=\"VARCHAR\" length=\"40\" nullable=\"0\" primaryKey=\"0\"/>"), "{item}");
+    assert!(item.contains("<key kind=\"columns\" columns=\"0\"/>"), "{item}");
+    assert!(zip_text(&bytes, "xl/_rels/workbook.xml.rels").contains("relationships/customXml\" Target=\"../customXml/item1.xml\""));
+    assert!(
+        zip_text(&bytes, "[Content_Types].xml")
+            .contains("/customXml/itemProps1.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.customXmlProperties+xml\"")
+    );
+
+    // Opened again in a new session: the source is back, with the database's path on this system.
+    let mut again = Session::new();
+    run(&mut again, "file.open", json!({"path": book}));
+    let src = again.doc().unwrap().wb.db_sources.first().cloned().expect("the source is read back");
+    assert_eq!(std::path::Path::new(&src.location), db_path.as_path());
+    assert_eq!((src.table.as_str(), src.columns.len()), ("orders", 8));
+    rusqlite::Connection::open(&db_path).unwrap().execute_batch("INSERT INTO orders (id, customer) VALUES (3, 'Citra');").unwrap();
+    run(&mut again, "sheet.activate", json!({"sheet": "orders"}));
+    run(&mut again, "selection.set", json!({"range": "A2"}));
+    let r = run(&mut again, "data.dbRefresh", json!({}));
+    assert_eq!(r["range"], "A1:H4");
+    let r = run(&mut again, "data.dbLoad", json!({"path": db_path.to_string_lossy(), "table": "orders"}));
+    assert_eq!((r["refreshed"].as_bool(), again.doc().unwrap().wb.sheets.len()), (Some(true), 2));
+    // Saved again: one part, not a kept copy beside the new one.
+    run(&mut again, "file.save", json!({}));
+    let bytes = std::fs::read(&book).unwrap();
+    let items = zip_parts(&bytes).into_iter().filter(|p| p.starts_with("customXml/item") && !p.contains("Props")).count();
+    assert_eq!(items, 1);
+    let _ = std::fs::remove_dir_all(&dir);
+}

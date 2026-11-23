@@ -533,9 +533,44 @@ pub fn save_bytes_as(wb: &Workbook, path: &str, kind: FileKind) -> Result<Vec<u8
 /// [`save_bytes`] for the file at `path`: relative paths to linked workbooks are rewritten for
 /// its folder, so they still name the same files.
 pub fn save_file_bytes(wb: &Workbook, path: &str) -> Result<Vec<u8>> {
-    match source_dir(path).and_then(|f| gridcraft_xlsx::rebase_links(wb, &f)) {
-        Some(rebased) => save_bytes(&rebased, path),
-        None => save_bytes(wb, path),
+    let folder = source_dir(path);
+    let rebased = folder.as_deref().and_then(|f| gridcraft_xlsx::rebase_links(wb, f));
+    let base = rebased.as_ref().unwrap_or(wb);
+    // Database files are named relative to the folder too (Data › DB Connect).
+    let db = folder.as_deref().and_then(|f| db_relative(base, f));
+    save_bytes(db.as_ref().unwrap_or(base), path)
+}
+
+/// A copy of `wb` for saving into `folder` whose loaded tables name their database files
+/// relative to it, as links to other workbooks are (a `file:///` address on another drive): the
+/// file then says nothing of the folders above it, and the workbook and its database can move
+/// together. `None` when nothing changes.
+pub(crate) fn db_relative(wb: &Workbook, folder: &std::path::Path) -> Option<Workbook> {
+    let mut out: Option<Workbook> = None;
+    for (i, src) in wb.db_sources.iter().enumerate() {
+        let file = std::path::Path::new(&src.location);
+        let Some(rel) = file.is_absolute().then(|| gridcraft_xlsx::link_target(file, folder)).flatten() else { continue };
+        if rel != src.location
+            && let Some(s) = out.get_or_insert_with(|| wb.clone()).db_sources.get_mut(i)
+        {
+            std::sync::Arc::make_mut(s).location = rel;
+        }
+    }
+    out
+}
+
+/// After a workbook is read from the file in `wb.source_dir`: its loaded tables' database files,
+/// written relative to that folder (or as `file:///` addresses), as paths on this system.
+pub fn resolve_db_locations(wb: &mut Workbook) {
+    let folder = wb.source_dir.clone();
+    for src in wb.db_sources.iter_mut() {
+        let loc = &src.location;
+        if std::path::Path::new(loc).is_absolute() && !loc.starts_with("file:") {
+            continue;
+        }
+        if let Some(path) = gridcraft_xlsx::link_path(loc, folder.as_deref()) {
+            std::sync::Arc::make_mut(src).location = path.to_string_lossy().into_owned();
+        }
     }
 }
 

@@ -222,7 +222,8 @@ impl Session {
     /// workbook as it is: the paths of its links are written from the folder of that file.
     /// A relative path follows the workbook into another folder
     /// ([`gridcraft_xlsx::rebase_links`]), and a linked workbook that is open here and has a
-    /// file is where that file is now. Paths are text: nothing is opened or tested for.
+    /// file is where that file is now; the database files of loaded tables are named relative to
+    /// it ([`crate::io::db_relative`]). Paths are text: nothing is opened or tested for.
     pub(crate) fn for_file(&self, doc: usize, path: &str) -> Option<Workbook> {
         let d = self.docs.get(doc)?;
         let folder = crate::io::source_dir(path)?;
@@ -244,7 +245,11 @@ impl Session {
         if changed {
             out.get_or_insert_with(|| (*d.wb).clone()).links = links;
         }
-        out
+        // Database files of loaded tables are named from that folder too (Data › DB Connect).
+        match crate::io::db_relative(out.as_ref().unwrap_or(&d.wb), &folder) {
+            Some(wb) => Some(wb),
+            None => out,
+        }
     }
 
     /// Updates the copies one workbook keeps. Whether anything changed; `None` when its

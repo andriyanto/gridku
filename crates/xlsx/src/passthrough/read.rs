@@ -53,6 +53,8 @@ pub struct KeptReader {
     overrides: HashMap<String, String>,
     budget: usize,
     parts_left: usize,
+    /// Workbook-level parts read into the model instead of kept (GridKu's own custom XML).
+    skip: Vec<String>,
 }
 
 impl KeptReader {
@@ -64,6 +66,7 @@ impl KeptReader {
             overrides: HashMap::new(),
             budget: kept_total(),
             parts_left: MAX_KEPT_PARTS,
+            skip: Vec::new(),
         };
         if let Ok(root) = raw_rels(cx, "")
             && root.iter().any(|r| r.rel_type.starts_with("http://purl.oclc.org/"))
@@ -179,6 +182,12 @@ impl KeptReader {
         Ok(())
     }
 
+    /// Leaves the part `name` (and what only it reaches) out of the workbook's kept content: it is
+    /// read into the model and written again from there.
+    pub fn skip_part(&mut self, name: String) {
+        self.skip.push(name);
+    }
+
     /// Package-root and workbook-level content.
     pub fn workbook(&mut self, cx: &mut Ctx<'_>, wb_part: &str, wb_xml: &xml::El, file_to_model: &[Option<usize>]) -> Option<Arc<Preserved>> {
         if !self.on {
@@ -207,7 +216,8 @@ impl KeptReader {
             }
         }
         let wb_rels = raw_rels(cx, wb_part).unwrap_or_default();
-        for r in wb_rels.iter().filter(|r| is_kind(r, WORKBOOK_ROOTS)) {
+        let skip = std::mem::take(&mut self.skip);
+        for r in wb_rels.iter().filter(|r| is_kind(r, WORKBOOK_ROOTS) && !skip.iter().any(|s| s.eq_ignore_ascii_case(&r.target))) {
             if let Err(why) = self.keep(cx, &mut p, std::slice::from_ref(r), &mut seen) {
                 cx.warn(format!("{} part {} was dropped: {why}", kind(&r.rel_type), r.target));
             }

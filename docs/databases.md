@@ -1,6 +1,6 @@
 # Databases: Data › DB Connect
 
-> **Last reviewed:** 2026-11-24 · **Last updated:** 2026-11-24 · **Change:** major (created: stage 1, reading SQLite) · **Target:** beyond Excel (Excel reads databases through Get Data and ODBC and never writes back)
+> **Last reviewed:** 2026-11-24 · **Last updated:** 2026-11-24 · **Change:** minor (a loaded table's source is saved in the XLSX file; earlier: created, stage 1, reading SQLite) · **Target:** beyond Excel (Excel reads databases through Get Data and ODBC and never writes back)
 
 GridKu reads tables from a database into sheets, and later will write changes back. This page
 records the design of the first stage and what it keeps for the next ones.
@@ -64,11 +64,22 @@ lists them through `app.commands`).
 8. **Macros.** A macro step that reads a database needs the person's permission, as reading a
    file does.
 
-## Not yet
+9. **Saved in the file, where Excel keeps it.** A workbook with loaded tables saved as XLSX has
+   one custom XML part (ECMA-376 Part 1, 22.5: `customXml/itemN.xml` with `itemPropsN.xml`,
+   related from the workbook), the place the format gives other applications' data. Excel
+   neither reads nor runs it, asks nothing about it, and keeps it when it saves the workbook.
+   Its root is `gridkuDbSources` in the namespace `urn:gridku:db-sources:1`; each `source` names
+   its sheet table by name and holds the engine, the database file, the database table, each
+   column's declared type and how rows are told apart (SQLite rowids are not written: a refresh
+   reads them again). Excel's own data connections (`connections.xml`, query tables) are not
+   used: Excel would take them for its own, warn that they are disabled and try to refresh them.
+10. **The database file relative to the workbook.** Saved to a file, the database's path is
+   written relative to the workbook's folder (`data/toko.db`, `../shared/toko.db`), as links to
+   other workbooks are, so the file names no folder above its own and the two can move
+   together; on another drive it is a `file:///` address. Opened again, it is the path on this
+   system. Custom XML of other applications is kept as it was, and GridKu's part is written once.
 
-- The source of a loaded table is kept in the session (Undo, recovery), not yet in the XLSX
-  file: after the workbook is saved and opened again, its table is ordinary data, and loading the
-  database table again makes a new sheet.
+## Not yet
 - A very large table takes a while to load (a read stops at two minutes); there is no progress
   bar of its own yet.
 - PostgreSQL (stage 2) and writing back (stage 3).
@@ -77,4 +88,5 @@ lists them through `app.commands`).
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-11-24 | minor | A loaded table's source is saved in the XLSX file as a custom XML part (which Excel keeps), the database file relative to the workbook; opened again, Refresh and Load find it |
 | 2026-11-24 | major | Created. Stage 1: Data › DB Connect reads SQLite files read-only; Tables and Views, Table Information (field, type, length), Load as a table in a new sheet, Refresh; column types and row keys kept for writing back later |
