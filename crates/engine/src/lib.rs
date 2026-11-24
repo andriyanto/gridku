@@ -208,6 +208,9 @@ pub struct DocState {
     pub sheet_selections: Vec<Selection>,
     /// Allow Edit Ranges unlocked with their password in this session: (sheet name, title).
     pub unlocked_ranges: Vec<(String, String)>,
+    /// Loading, refreshing or saving a table of a database is under way: its header row and key
+    /// columns, which edits otherwise leave as they are, may change (`cmd::data::db_write`).
+    pub(crate) db_locks_off: bool,
     /// The format `path`'s content was recognised as when its extension doesn't name one (an
     /// XLSX called `budget.dat`): Save writes it back in that format.
     pub content_kind: Option<io::FileKind>,
@@ -321,6 +324,7 @@ impl DocState {
             title: self.title.clone(),
             sheet_selections: self.sheet_selections.clone(),
             unlocked_ranges: self.unlocked_ranges.clone(),
+            db_locks_off: false,
             content_kind: self.content_kind,
             scripts_trusted: self.scripts_trusted,
             trust: self.trust,
@@ -366,6 +370,7 @@ impl DocState {
             title,
             sheet_selections: vec![],
             unlocked_ranges: vec![],
+            db_locks_off: false,
             content_kind: None,
             scripts_trusted,
             trust,

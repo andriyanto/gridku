@@ -5,6 +5,12 @@
 //! A source belongs to the [`Table`](crate::Table) its data was loaded into, by the table's id:
 //! deleting the table (or its sheet) leaves a source that names no table, which is ignored. No
 //! password is ever kept here.
+//!
+//! A table with a primary key also keeps, in memory only, each row as the database had it when it
+//! was loaded ([`DbOriginal`]): saving compares the sheet with it to find what changed, and the
+//! database with it to find rows someone else changed meanwhile. A file doesn't keep it.
+
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
@@ -73,4 +79,36 @@ pub struct DbSource {
     pub columns: Vec<DbColumn>,
     #[serde(default)]
     pub key: DbRowKey,
+    /// The rows as the database had them when they were loaded or last saved (in memory only).
+    #[serde(skip)]
+    pub original: DbOriginal,
 }
+
+/// A value as the database had it.
+#[derive(Clone, Debug, PartialEq)]
+pub enum DbCell {
+    Null,
+    Integer(i64),
+    Real(f64),
+    Text(String),
+    /// Binary data, by its size.
+    Blob(usize),
+}
+
+/// The rows of a loaded table as the database had them, in the order loaded, each with every
+/// column of [`DbSource::columns`]. None for a table not loaded in this session (opened from a
+/// file) or one without a primary key. Two are equal when they are the same rows in memory.
+#[derive(Clone, Debug, Default)]
+pub struct DbOriginal(pub Option<Arc<Vec<Vec<DbCell>>>>);
+
+impl PartialEq for DbOriginal {
+    fn eq(&self, other: &Self) -> bool {
+        match (&self.0, &other.0) {
+            (None, None) => true,
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+            _ => false,
+        }
+    }
+}
+
+impl Eq for DbOriginal {}

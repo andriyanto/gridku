@@ -5,9 +5,9 @@
 use std::time::Instant;
 
 use rusqlite::types::ValueRef;
-use rusqlite::{Connection, ErrorCode, OpenFlags};
+use rusqlite::{Connection, ErrorCode, OpenFlags, TransactionBehavior};
 
-use crate::{ColumnInfo, DbError, DbValue, Limits, ObjectInfo, ObjectKind, RowKey, Step, Stop, TableData, split_type};
+use crate::{ColumnInfo, DbError, DbValue, Limits, ObjectInfo, ObjectKind, RowChange, RowKey, Step, Stop, TableData, WriteTarget, split_type};
 
 /// SQLite's own error as ours. An interrupted statement was cancelled, or ran out of time.
 fn db_err(e: rusqlite::Error, limits: Option<&Limits>) -> DbError {
@@ -113,6 +113,152 @@ fn cut(text: &str, max: usize, cut_texts: &mut usize) -> String {
     }
 }
 
+/// A value as it is read: a text cut to `max_text` characters, a BLOB by its size.
+fn value(v: ValueRef<'_>, max_text: usize, cut_texts: &mut usize) -> DbValue {
+    match v {
+        ValueRef::Null => DbValue::Null,
+        ValueRef::Integer(n) => DbValue::Integer(n),
+        ValueRef::Real(x) => DbValue::Real(x),
+        ValueRef::Text(t) => DbValue::Text(cut(&String::from_utf8_lossy(t), max_text, cut_texts)),
+        ValueRef::Blob(b) => DbValue::Blob(b.len()),
+    }
+}
+
+/// A value to bind to a statement. A BLOB, known only by its size, can't be written.
+fn param(v: &DbValue) -> Result<rusqlite::types::Value, DbError> {
+    use rusqlite::types::Value as V;
+    Ok(match v {
+        DbValue::Null => V::Null,
+        DbValue::Integer(n) => V::Integer(*n),
+        DbValue::Real(x) => V::Real(*x),
+        DbValue::Text(t) => V::Text(t.clone()),
+        DbValue::Blob(_) => return Err(DbError::Database("binary data (a BLOB) can't be written from a sheet".into())),
+    })
+}
+
+/// Opens the database to write to: an existing file, never created, its schema not trusted.
+fn open_rw(path: &str) -> Result<Connection, DbError> {
+    if !std::path::Path::new(path).is_file() {
+        return Err(DbError::Database(format!("there is no database file at {path}")));
+    }
+    let flags = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let conn = Connection::open_with_flags(path, flags).map_err(|e| db_err(e, None))?;
+    conn.pragma_update(None, "trusted_schema", false).map_err(|e| db_err(e, None))?;
+    conn.busy_timeout(std::time::Duration::from_secs(5)).map_err(|e| db_err(e, None))?;
+    conn.query_row("SELECT count(*) FROM sqlite_schema", [], |_| Ok(())).map_err(|e| db_err(e, None))?;
+    Ok(conn)
+}
+
+/// How often (in rows) a write reports its progress and asks whether to stop.
+const WRITE_REPORT_EVERY: usize = 200;
+
+pub(crate) fn write(
+    path: &str,
+    target: WriteTarget<'_>,
+    changes: &[RowChange],
+    limits: Limits,
+    stop: Option<Stop>,
+    progress: &mut dyn FnMut(Step),
+) -> Result<Vec<Vec<DbValue>>, DbError> {
+    let stopped = |s: &Option<Stop>| s.as_ref().is_some_and(|f| f());
+    let cancelled = |e: DbError, s: &Option<Stop>| if stopped(s) { DbError::Cancelled } else { e };
+    let table = target.table;
+    progress(Step::Connecting);
+    let mut conn = open_rw(path)?;
+    if object(&conn, table)?.0 == ObjectKind::View {
+        return Err(DbError::Database(format!("\"{table}\" is a view: its rows can't be changed")));
+    }
+    let names: Vec<String> = target.columns.iter().map(|c| quote(c)).collect();
+    if names.is_empty() || target.key.is_empty() {
+        return Err(DbError::Database("there is no primary key to find the rows by".into()));
+    }
+    let key_names = target
+        .key
+        .iter()
+        .map(|&k| names.get(k).cloned())
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| DbError::Database("the primary key is not among the columns".into()))?;
+    let deadline = Instant::now() + limits.timeout;
+    let asked = stop.clone();
+    conn.progress_handler(10_000, Some(move || Instant::now() > deadline || asked.as_ref().is_some_and(|f| f()))).map_err(|e| db_err(e, None))?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e| cancelled(db_err(e, Some(&limits)), &stop))?;
+    let by_key = key_names.iter().enumerate().map(|(i, k)| format!("{k} IS ?{}", i + 1)).collect::<Vec<_>>().join(" AND ");
+    let select = format!("SELECT {} FROM {} WHERE {by_key}", names.join(", "), quote(table));
+    let total = changes.len();
+    let mut cut_texts = 0usize;
+    // Read each row again: it must be there, with the values it had.
+    let mut conflicts = Vec::new();
+    {
+        let mut st = tx.prepare(&select).map_err(|e| cancelled(db_err(e, Some(&limits)), &stop))?;
+        for (i, ch) in changes.iter().enumerate() {
+            if i.is_multiple_of(WRITE_REPORT_EVERY) {
+                if stopped(&stop) {
+                    return Err(DbError::Cancelled);
+                }
+                progress(Step::Checked { done: i, total });
+            }
+            let key = ch.key.iter().map(param).collect::<Result<Vec<_>, _>>()?;
+            let mut rows = st.query(rusqlite::params_from_iter(key)).map_err(|e| cancelled(db_err(e, Some(&limits)), &stop))?;
+            let same = match rows.next().map_err(|e| cancelled(db_err(e, Some(&limits)), &stop))? {
+                None => false,
+                Some(row) => {
+                    let mut same = true;
+                    for (c, old, _) in &ch.set {
+                        let now = value(row.get_ref(*c).map_err(|e| db_err(e, Some(&limits)))?, limits.max_text, &mut cut_texts);
+                        same &= now == *old;
+                    }
+                    same
+                }
+            };
+            if !same {
+                conflicts.push(i);
+            }
+        }
+    }
+    if !conflicts.is_empty() {
+        return Err(DbError::Conflict(conflicts));
+    }
+    progress(Step::Checked { done: total, total });
+    let mut out = Vec::with_capacity(total);
+    for (i, ch) in changes.iter().enumerate() {
+        if i.is_multiple_of(WRITE_REPORT_EVERY) {
+            if stopped(&stop) {
+                return Err(DbError::Cancelled);
+            }
+            progress(Step::Written { done: i, total });
+        }
+        let mut sets = Vec::with_capacity(ch.set.len());
+        let mut params = Vec::with_capacity(ch.set.len() + ch.key.len());
+        for (c, _, new) in &ch.set {
+            let name = names.get(*c).ok_or_else(|| DbError::Database("a column to set is not among the columns".into()))?;
+            params.push(param(new)?);
+            sets.push(format!("{name} = ?{}", params.len()));
+        }
+        if !sets.is_empty() {
+            let at = params.len();
+            params.extend(ch.key.iter().map(param).collect::<Result<Vec<_>, _>>()?);
+            let wher = key_names.iter().enumerate().map(|(n, k)| format!("{k} IS ?{}", at + n + 1)).collect::<Vec<_>>().join(" AND ");
+            let sql = format!("UPDATE {} SET {} WHERE {wher}", quote(table), sets.join(", "));
+            tx.execute(&sql, rusqlite::params_from_iter(params)).map_err(|e| cancelled(db_err(e, Some(&limits)), &stop))?;
+        }
+        // The row as it is now (a key column is never set, so the same key finds it).
+        let key = ch.key.iter().map(param).collect::<Result<Vec<_>, _>>()?;
+        let row = tx
+            .query_row(&select, rusqlite::params_from_iter(key), |r| {
+                let mut n = 0usize;
+                (0..names.len()).map(|c| Ok(value(r.get_ref(c)?, limits.max_text, &mut n))).collect::<Result<Vec<_>, rusqlite::Error>>()
+            })
+            .map_err(|e| cancelled(db_err(e, Some(&limits)), &stop))?;
+        out.push(row);
+    }
+    if stopped(&stop) {
+        return Err(DbError::Cancelled);
+    }
+    tx.commit().map_err(|e| cancelled(db_err(e, Some(&limits)), &stop))?;
+    progress(Step::Written { done: total, total });
+    Ok(out)
+}
+
 pub(crate) fn read(path: &str, table: &str, limits: Limits, stop: Option<Stop>, progress: &mut dyn FnMut(Step)) -> Result<TableData, DbError> {
     let stopped = |s: &Option<Stop>| s.as_ref().is_some_and(|f| f());
     let cancelled = |e: DbError, s: &Option<Stop>| if stopped(s) { DbError::Cancelled } else { e };
@@ -171,14 +317,7 @@ pub(crate) fn read(path: &str, table: &str, limits: Limits, stop: Option<Stop>, 
         }
         let mut values = Vec::with_capacity(columns.len());
         for i in 0..columns.len() {
-            let v = match row.get_ref(i + offset).map_err(|e| db_err(e, Some(&limits)))? {
-                ValueRef::Null => DbValue::Null,
-                ValueRef::Integer(n) => DbValue::Integer(n),
-                ValueRef::Real(x) => DbValue::Real(x),
-                ValueRef::Text(t) => DbValue::Text(cut(&String::from_utf8_lossy(t), limits.max_text, &mut cut_texts)),
-                ValueRef::Blob(b) => DbValue::Blob(b.len()),
-            };
-            values.push(v);
+            values.push(value(row.get_ref(i + offset).map_err(|e| db_err(e, Some(&limits)))?, limits.max_text, &mut cut_texts));
         }
         out.push(values);
     }
@@ -327,5 +466,65 @@ mod tests {
         let db = TempDb::new("readonly", SHOP);
         let conn = open(db.path()).unwrap();
         assert!(conn.execute("DELETE FROM customers", []).is_err());
+    }
+
+    fn customers(columns: &[String]) -> WriteTarget<'_> {
+        WriteTarget { schema: None, table: "customers", columns, key: &[0] }
+    }
+
+    #[test]
+    fn writes_changed_rows_in_one_transaction_and_reads_them_back() {
+        let db = TempDb::new("write", SHOP);
+        let cols: Vec<String> = ["id", "name", "balance", "note"].map(String::from).to_vec();
+        let changes = [
+            RowChange {
+                key: vec![DbValue::Integer(1)],
+                set: vec![(1, DbValue::Text("Ana".into()), DbValue::Text("Ani".into())), (3, DbValue::Null, DbValue::Text("baru".into()))],
+            },
+            RowChange { key: vec![DbValue::Integer(2)], set: vec![(2, DbValue::Integer(-3), DbValue::Real(7.25))] },
+        ];
+        let mut steps = Vec::new();
+        let back = write(db.path(), customers(&cols), &changes, Limits::default(), None, &mut |s| steps.push(s)).unwrap();
+        assert_eq!(back[0], [DbValue::Integer(1), DbValue::Text("Ani".into()), DbValue::Real(12.5), DbValue::Text("baru".into())]);
+        assert_eq!(back[1][2], DbValue::Real(7.25));
+        assert_eq!(steps.first(), Some(&Step::Connecting));
+        assert_eq!(steps.last(), Some(&Step::Written { done: 2, total: 2 }));
+        let t = read_all(db.path(), "customers", Limits::default()).unwrap();
+        assert_eq!(t.rows[0][1], DbValue::Text("Ani".into()));
+        assert_eq!(t.rows[1][2], DbValue::Real(7.25));
+    }
+
+    #[test]
+    fn a_row_changed_or_gone_since_it_was_read_stops_the_whole_write() {
+        let db = TempDb::new("conflict", SHOP);
+        let cols: Vec<String> = ["id", "name"].map(String::from).to_vec();
+        let changes = [
+            RowChange { key: vec![DbValue::Integer(1)], set: vec![(1, DbValue::Text("Ana".into()), DbValue::Text("Ani".into()))] },
+            // Someone else renamed Budi meanwhile.
+            RowChange { key: vec![DbValue::Integer(2)], set: vec![(1, DbValue::Text("Budi".into()), DbValue::Text("Bud".into()))] },
+            RowChange { key: vec![DbValue::Integer(99)], set: vec![(1, DbValue::Text("x".into()), DbValue::Text("y".into()))] },
+        ];
+        let e = write(db.path(), customers(&cols), &changes, Limits::default(), None, &mut |_| {}).unwrap_err();
+        assert!(matches!(&e, DbError::Conflict(rows) if *rows == [1, 2]), "{e:?}");
+        let t = read_all(db.path(), "customers", Limits::default()).unwrap();
+        assert_eq!(t.rows[0][1], DbValue::Text("Ana".into()), "nothing written");
+    }
+
+    #[test]
+    fn writing_refuses_views_blobs_and_stops_when_asked() {
+        let db = TempDb::new("write-refuse", SHOP);
+        let cols: Vec<String> = ["name"].map(String::from).to_vec();
+        let view = WriteTarget { schema: None, table: "rich", columns: &cols, key: &[0] };
+        assert!(write(db.path(), view, &[], Limits::default(), None, &mut |_| {}).is_err());
+        let cols: Vec<String> = ["id", "photo"].map(String::from).to_vec();
+        let blob = [RowChange { key: vec![DbValue::Integer(1)], set: vec![(1, DbValue::Blob(4), DbValue::Blob(1))] }];
+        assert!(write(db.path(), customers(&cols), &blob, Limits::default(), None, &mut |_| {}).is_err());
+        let cols: Vec<String> = ["id", "name"].map(String::from).to_vec();
+        let one = [RowChange { key: vec![DbValue::Integer(1)], set: vec![(1, DbValue::Text("Ana".into()), DbValue::Text("Ani".into()))] }];
+        let stop: Stop = std::sync::Arc::new(|| true);
+        assert!(matches!(write(db.path(), customers(&cols), &one, Limits::default(), Some(stop), &mut |_| {}), Err(DbError::Cancelled)));
+        assert!(matches!(write("/no/such.db", customers(&cols), &one, Limits::default(), None, &mut |_| {}), Err(DbError::Database(_))));
+        let t = read_all(db.path(), "customers", Limits::default()).unwrap();
+        assert_eq!(t.rows[0][1], DbValue::Text("Ana".into()));
     }
 }

@@ -1,13 +1,18 @@
 //! GridKu's database sources (Data › DB Connect): list the tables and views of a database, the
 //! columns of one, and read one, for the engine to load into a sheet.
 //!
-//! SQLite and PostgreSQL. Nothing in a database is changed: no statement is run but the
-//! catalogue queries, a `count(*)` and one `SELECT` of the table asked for. A SQLite file is
-//! opened read-only, never created, and is hostile input: the schema it holds is not trusted
+//! SQLite and PostgreSQL. Reading changes nothing: no statement is run but the catalogue
+//! queries, a `count(*)` and one `SELECT` of the table asked for. A SQLite file is opened
+//! read-only, never created, and is hostile input: the schema it holds is not trusted
 //! (`trusted_schema=OFF`) and no extension can be loaded. A PostgreSQL session is read-only
 //! (`default_transaction_read_only`), over TLS when the server offers it (rustls, the system's
 //! certificate authorities), and its password is only ever held for the call. Every read is
 //! bounded in rows, cells, text length and time.
+//!
+//! Writing ([`sqlite_write`], [`pg_write`]) only ever runs `UPDATE`s of rows found by their
+//! primary key, in one transaction: each row is first read again (and locked) and compared with
+//! the values it had when it was loaded, and if any changed in the database since, or is gone,
+//! nothing is written ([`DbError::Conflict`]).
 //!
 //! Each column keeps its declared type, split into a type and a length (`VARCHAR(50)` is
 //! `VARCHAR` and `50`), whether it may be NULL and its place in the primary key; each table read
@@ -28,7 +33,20 @@ use std::time::Duration;
 pub enum Step {
     Connecting,
     Counting,
-    Rows { done: usize, total: usize },
+    Rows {
+        done: usize,
+        total: usize,
+    },
+    /// Writing: the rows checked against the database so far, of how many are to be written.
+    Checked {
+        done: usize,
+        total: usize,
+    },
+    /// Writing: the rows written so far.
+    Written {
+        done: usize,
+        total: usize,
+    },
 }
 
 /// Asked now and then while a read runs: `true` stops it ([`DbError::Cancelled`]).
@@ -52,6 +70,10 @@ pub enum DbError {
     Cancelled,
     #[error("databases can't be read in the web version")]
     Unavailable,
+    /// Writing found rows that changed in the database since they were read, or are gone: their
+    /// indexes among the changes. Nothing was written.
+    #[error("{} rows were changed in the database since they were loaded; nothing was saved", .0.len())]
+    Conflict(Vec<usize>),
 }
 
 /// A table or a view.
@@ -142,6 +164,27 @@ pub struct TableData {
     pub truncated: bool,
     /// Texts longer than [`Limits::max_text`] characters, cut to it.
     pub cut_texts: usize,
+}
+
+/// One row to write: found by its primary key, with the columns to set.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RowChange {
+    /// The primary key's values as they were read, in key order.
+    pub key: Vec<DbValue>,
+    /// Each column to set: its index among the columns written, its value as it was read, and
+    /// the new value (never a [`DbValue::Blob`]).
+    pub set: Vec<(usize, DbValue, DbValue)>,
+}
+
+/// The table to write to (PostgreSQL's in `schema`, `public` when none): its columns, in the
+/// order the values of [`RowChange`] and the rows read back use, and which of them make the
+/// primary key, in key order.
+#[derive(Clone, Copy, Debug)]
+pub struct WriteTarget<'a> {
+    pub schema: Option<&'a str>,
+    pub table: &'a str,
+    pub columns: &'a [String],
+    pub key: &'a [usize],
 }
 
 /// The bounds of one read.
@@ -349,6 +392,44 @@ pub fn sqlite_read(path: &str, table: &str, limits: Limits, stop: Option<Stop>, 
     #[cfg(target_arch = "wasm32")]
     {
         let _ = (path, table, limits, stop, progress);
+        Err(DbError::Unavailable)
+    }
+}
+
+/// Writes `changes` to the table `target.table` of the SQLite database at `path`, in one transaction,
+/// and gives each changed row as it reads back afterwards (all of `target.columns`), in the
+/// order of `changes`. Within `limits.timeout`; `stop` and `progress` as for [`sqlite_read`].
+pub fn sqlite_write(
+    path: &str,
+    target: WriteTarget<'_>,
+    changes: &[RowChange],
+    limits: Limits,
+    stop: Option<Stop>,
+    progress: &mut dyn FnMut(Step),
+) -> Result<Vec<Vec<DbValue>>, DbError> {
+    #[cfg(not(target_arch = "wasm32"))]
+    return sqlite::write(path, target, changes, limits, stop, progress);
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = (path, target, changes, limits, stop, progress);
+        Err(DbError::Unavailable)
+    }
+}
+
+/// Writes `changes` to `target.schema.table` of the PostgreSQL database `cfg` names, as [`sqlite_write`].
+pub fn pg_write(
+    cfg: &PgConfig,
+    target: WriteTarget<'_>,
+    changes: &[RowChange],
+    limits: Limits,
+    stop: Option<Stop>,
+    progress: &mut dyn FnMut(Step),
+) -> Result<Vec<Vec<DbValue>>, DbError> {
+    #[cfg(not(target_arch = "wasm32"))]
+    return postgres::write(cfg, target, changes, limits, stop, progress);
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = (cfg, target, changes, limits, stop, progress);
         Err(DbError::Unavailable)
     }
 }
