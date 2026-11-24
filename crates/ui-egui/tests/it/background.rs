@@ -448,6 +448,10 @@ fn the_busy_box_shows_a_commands_progress() {
     assert!(h.state().is_busy());
     h.run_steps(2);
     assert!(shows(&h, "Calculating…"), "nothing reported yet: the spinner alone");
+    progress.report(gridcraft_engine::progress::Phase::Connecting, 0, 0);
+    h.run_steps(2);
+    assert!(shows(&h, "Connecting…"), "connecting: what it waits for, a bar without a count");
+    assert!(h.query_all_by_label_contains(" / ").next().is_none());
     progress.report(gridcraft_engine::progress::Phase::ReadingRows, 500, 1000);
     h.run_steps(2);
     assert!(shows(&h, "Reading rows…"));

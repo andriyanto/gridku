@@ -22,6 +22,15 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+/// Where a read has got, for a progress bar: connecting, counting the rows, then the rows read
+/// of how many there are.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Step {
+    Connecting,
+    Counting,
+    Rows { done: usize, total: usize },
+}
+
 /// Asked now and then while a read runs: `true` stops it ([`DbError::Cancelled`]).
 pub type Stop = Arc<dyn Fn() -> bool + Send + Sync>;
 
@@ -297,7 +306,7 @@ pub fn pg_read(
     table: &str,
     limits: Limits,
     stop: Option<Stop>,
-    progress: &mut dyn FnMut(usize, usize),
+    progress: &mut dyn FnMut(Step),
 ) -> Result<TableData, DbError> {
     #[cfg(not(target_arch = "wasm32"))]
     return postgres::read(cfg, schema, table, limits, stop, progress);
@@ -331,15 +340,10 @@ pub fn sqlite_columns(path: &str, table: &str) -> Result<Vec<ColumnInfo>, DbErro
 }
 
 /// Reads the table or view `table` of the SQLite database at `path`, within `limits`. `stop`,
-/// when given, is asked now and then whether to stop; `progress` hears how many rows have been
-/// read of how many there are (counted first, at most the rows read), every so many rows.
-pub fn sqlite_read(
-    path: &str,
-    table: &str,
-    limits: Limits,
-    stop: Option<Stop>,
-    progress: &mut dyn FnMut(usize, usize),
-) -> Result<TableData, DbError> {
+/// when given, is asked now and then whether to stop; `progress` hears each [`Step`]: counting the
+/// rows, then how many have been read of how many there are (at most the rows read), every so
+/// many rows.
+pub fn sqlite_read(path: &str, table: &str, limits: Limits, stop: Option<Stop>, progress: &mut dyn FnMut(Step)) -> Result<TableData, DbError> {
     #[cfg(not(target_arch = "wasm32"))]
     return sqlite::read(path, table, limits, stop, progress);
     #[cfg(target_arch = "wasm32")]

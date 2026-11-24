@@ -10,7 +10,7 @@ use postgres::fallible_iterator::FallibleIterator;
 use postgres::types::ToSql;
 use postgres::{Client, Config};
 
-use crate::{ColumnInfo, DbError, DbValue, Limits, ObjectInfo, ObjectKind, PgConfig, RowKey, SslMode, Stop, TableData};
+use crate::{ColumnInfo, DbError, DbValue, Limits, ObjectInfo, ObjectKind, PgConfig, RowKey, SslMode, Step, Stop, TableData};
 
 /// How long connecting may take.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -205,11 +205,15 @@ pub(crate) fn read(
     table: &str,
     limits: Limits,
     stop: Option<Stop>,
-    progress: &mut dyn FnMut(usize, usize),
+    progress: &mut dyn FnMut(Step),
 ) -> Result<TableData, DbError> {
     let stopped = |s: &Option<Stop>| s.as_ref().is_some_and(|f| f());
     let deadline = Instant::now() + limits.timeout;
+    progress(Step::Connecting);
     let mut client = connect(cfg, limits.timeout)?;
+    if stopped(&stop) {
+        return Err(DbError::Cancelled);
+    }
     let mut cols = columns_of(&mut client, schema, table)?;
     let mut truncated = false;
     if cols.len() > limits.max_columns {
@@ -222,10 +226,11 @@ pub(crate) fn read(
     let width = cols.len().max(1);
     let max_rows = limits.max_rows.min(limits.max_cells / width);
     let from = qualified(schema, table);
+    progress(Step::Counting);
     let count: i64 =
         client.query_one(&format!("SELECT count(*) FROM {from}"), &[]).and_then(|r| r.try_get(0)).map_err(|e| db_err(e, Some(&limits)))?;
     let total = usize::try_from(count).unwrap_or(0).min(max_rows);
-    progress(0, total);
+    progress(Step::Rows { done: 0, total });
     if stopped(&stop) {
         return Err(DbError::Cancelled);
     }
@@ -244,7 +249,7 @@ pub(crate) fn read(
             if Instant::now() > deadline {
                 return Err(DbError::TimedOut(limits.timeout.as_secs()));
             }
-            progress(out.len(), total.max(out.len()));
+            progress(Step::Rows { done: out.len(), total: total.max(out.len()) });
         }
         let mut values = Vec::with_capacity(cols.len());
         for (i, c) in cols.iter().enumerate() {
@@ -253,7 +258,7 @@ pub(crate) fn read(
         }
         out.push(values);
     }
-    progress(out.len(), out.len());
+    progress(Step::Rows { done: out.len(), total: out.len() });
     Ok(TableData { columns: cols.into_iter().map(|c| c.info).collect(), rows: out, key, rowids: Vec::new(), truncated, cut_texts })
 }
 
@@ -346,7 +351,7 @@ mod server_tests {
         assert_eq!(shown[2], ("saldo", "numeric", Some("12,2"), true, 0));
         assert_eq!(shown[9].1, "mood");
         assert_eq!(shown[10].1, "int4[]");
-        let t = read(&cfg, "public", "pelanggan", Limits::default(), None, &mut |_, _| {}).unwrap();
+        let t = read(&cfg, "public", "pelanggan", Limits::default(), None, &mut |_| {}).unwrap();
         assert_eq!(t.key, RowKey::Columns(vec![0]));
         let ana = &t.rows[0];
         assert_eq!(ana[1], DbValue::Text("Ana".into()));
@@ -361,7 +366,12 @@ mod server_tests {
         assert_eq!(t.rows[1][2], DbValue::Null);
         // A composite key in key order, and progress.
         let mut seen = Vec::new();
-        let t = read(&cfg, "gudang", "stok", Limits::default(), None, &mut |d, n| seen.push((d, n))).unwrap();
+        let t = read(&cfg, "gudang", "stok", Limits::default(), None, &mut |step| {
+            if let Step::Rows { done, total } = step {
+                seen.push((done, total))
+            }
+        })
+        .unwrap();
         assert_eq!((t.key, t.rows.len()), (RowKey::Columns(vec![1, 0]), 2500));
         assert_eq!(seen.first(), Some(&(0, 2500)));
         assert_eq!(seen.last(), Some(&(2500, 2500)));

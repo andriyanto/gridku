@@ -472,14 +472,22 @@ pub(crate) fn overlay(app: &mut SheetApp, ctx: &egui::Context) {
                 ui.label(format!("{seconds:.0} s"));
             }
         });
-        if let Some((_, done, total)) = progress {
+        if let Some((phase, done, total)) = progress {
             ui.add_space(6.0);
-            let fraction = if total > 0 { (done as f32 / total as f32).clamp(0.0, 1.0) } else { 0.0 };
-            let text =
-                if total > 0 { format!("{} / {} ({:.0}%)", group_digits(done), group_digits(total), fraction * 100.0) } else { group_digits(done) };
-            ui.label(text);
-            ui.add_space(4.0);
-            progress_bar(ui, (total > 0).then_some(fraction));
+            if phase.counts() {
+                let fraction = if total > 0 { (done as f32 / total as f32).clamp(0.0, 1.0) } else { 0.0 };
+                let text = if total > 0 {
+                    format!("{} / {} ({:.0}%)", group_digits(done), group_digits(total), fraction * 100.0)
+                } else {
+                    group_digits(done)
+                };
+                ui.label(text);
+                ui.add_space(4.0);
+                progress_bar(ui, (total > 0).then_some(fraction));
+            } else {
+                // Connecting, counting: no count yet, the bar runs back and forth.
+                progress_bar(ui, None);
+            }
         }
         ui.add_space(8.0);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
