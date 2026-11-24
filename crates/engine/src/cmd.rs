@@ -431,6 +431,9 @@ pub(crate) fn commit<R>(d: &mut DocState, f: impl FnOnce(&mut Ctx) -> Result<R>)
     if !protection_checked {
         check_protection(&d.wb, &wb, &d.unlocked_ranges)?;
     }
+    if !d.db_locks_off && !d.wb.db_sources.is_empty() {
+        data::db_locks(&d.wb, &wb, structural)?;
+    }
     if !structural {
         check_arrays(&d.wb, &wb)?;
     }

@@ -3,7 +3,7 @@
 //! reads it every frame without waiting for the command.
 //!
 //! Only commands that know their size report (loading a database table: the rows read, then the
-//! rows written); others leave it empty and the interface shows its spinner alone.
+//! rows written; saving to one: the rows checked, then the rows saved); others leave it empty and the interface shows its spinner alone.
 
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
@@ -18,6 +18,10 @@ pub enum Phase {
     ReadingRows,
     /// Putting rows in the sheet.
     WritingRows,
+    /// Saving: reading the rows to save again from the database, to find any changed there.
+    CheckingRows,
+    /// Saving rows to a database.
+    SavingRows,
 }
 
 impl Phase {
@@ -28,12 +32,14 @@ impl Phase {
             Phase::CountingRows => "Counting rows",
             Phase::ReadingRows => "Reading rows",
             Phase::WritingRows => "Writing rows",
+            Phase::CheckingRows => "Checking rows",
+            Phase::SavingRows => "Saving rows",
         }
     }
 
     /// Whether the phase has a count to show (else the bar runs back and forth).
     pub fn counts(self) -> bool {
-        matches!(self, Phase::ReadingRows | Phase::WritingRows)
+        matches!(self, Phase::ReadingRows | Phase::WritingRows | Phase::CheckingRows | Phase::SavingRows)
     }
 
     fn code(self) -> u8 {
@@ -42,6 +48,8 @@ impl Phase {
             Phase::WritingRows => 2,
             Phase::Connecting => 3,
             Phase::CountingRows => 4,
+            Phase::CheckingRows => 5,
+            Phase::SavingRows => 6,
         }
     }
 
@@ -51,6 +59,8 @@ impl Phase {
             2 => Some(Phase::WritingRows),
             3 => Some(Phase::Connecting),
             4 => Some(Phase::CountingRows),
+            5 => Some(Phase::CheckingRows),
+            6 => Some(Phase::SavingRows),
             _ => None,
         }
     }

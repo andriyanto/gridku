@@ -166,6 +166,7 @@ pub(crate) fn read(cx: &mut Ctx<'_>, wb_rels: &[Rel], wb: &mut Workbook) -> Opti
             table_id: id,
             columns,
             key,
+            original: Default::default(),
         }));
     }
     Some(name)

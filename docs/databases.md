@@ -1,9 +1,9 @@
 # Databases: Data › DB Connect
 
-> **Last reviewed:** 2026-11-24 · **Last updated:** 2026-11-24 · **Change:** minor (waiting for a server shows what is happening, with Cancel; earlier: stage 2: PostgreSQL; earlier: a progress bar and Cancel while a large table loads; earlier: a loaded table's source is saved in the XLSX file; earlier: created, stage 1, reading SQLite) · **Target:** beyond Excel (Excel reads databases through Get Data and ODBC and never writes back)
+> **Last reviewed:** 2026-11-24 · **Last updated:** 2026-11-24 · **Change:** minor (stage 3: changed values are saved back to the database, with the header row and key columns locked and each column validated by its type; earlier: waiting for a server shows what is happening, with Cancel; earlier: stage 2: PostgreSQL; earlier: a progress bar and Cancel while a large table loads; earlier: a loaded table's source is saved in the XLSX file; earlier: created, stage 1, reading SQLite) · **Target:** beyond Excel (Excel reads databases through Get Data and ODBC and never writes back)
 
-GridKu reads tables from a database into sheets, and later will write changes back. This page
-records the design of the first stage and what it keeps for the next ones.
+GridKu reads tables from a database into sheets and writes the values changed in them back. This
+page records the design of each stage.
 
 ## Stages
 
@@ -11,7 +11,8 @@ records the design of the first stage and what it keeps for the next ones.
 |---|---|
 | 1 (built) | SQLite: list a database file's tables and views, show a table's fields, load one into a sheet as a table, refresh it |
 | 2 (built) | PostgreSQL in the same pane: host, port, database, user, password and SSL; tables and views schema by schema; the password is asked for each time and never stored |
-| 3 | Editing: changes to a loaded table are written back to the database |
+| 3 (built) | Saving: the values changed in a loaded table are written back to the database; the header row and key columns are locked, and each column is validated by its type |
+| 4 | Adding and deleting rows |
 
 ## The pane
 
@@ -25,16 +26,18 @@ Data › **DB Connect** opens a task pane on the right.
   each schema (`public` open, the system's own left out). A click selects one;
   **Load** puts it in a sheet. Right-clicking one offers **Table Information…** (a window listing
   each field's name, type, length, whether it may be NULL and its place in the primary key) and
-  **Load**. **Refresh** reads again the table at the active cell.
+  **Load**. **Refresh** reads again the table at the active cell, and **Save to Database** writes
+  the values changed in it back.
 
 Every action is a command, so the CLI, the control channel and MCP reach them too:
-`data.dbTables`, `data.dbColumns`, `data.dbLoad`, `data.dbRefresh` (`docs/control-protocol.md`
-lists them through `app.commands`).
+`data.dbTables`, `data.dbColumns`, `data.dbLoad`, `data.dbRefresh`, `data.dbSave`
+(`docs/control-protocol.md` lists them through `app.commands`).
 
 ## Decisions
 
-1. **Read-only, and nothing runs because a file says so.** The database file is opened
-   read-only and never created; its schema isn't trusted (`trusted_schema=OFF`), no statement
+1. **Reading is read-only, and nothing runs because a file says so.** Listing, Table
+   Information, Load and Refresh open the database file read-only (only Save to Database opens it
+   to write, decision 19), and it is never created; its schema isn't trusted (`trusted_schema=OFF`), no statement
    can write (`query_only`), no extension is loaded. The only statements are the catalogue's and
    one `SELECT` of the table chosen. A workbook that holds a loaded table doesn't connect when it
    opens: Refresh is asked for.
@@ -114,9 +117,58 @@ lists them through `app.commands`).
    before the counted phases, with a bar that moves back and forth because nothing can be
    counted yet; Cancel works in every phase.
 
+## Saving changes back (stage 3)
+
+15. **Only values.** Saving runs `UPDATE`s of rows that are already in the database, nothing
+   else: no column is renamed, added or dropped, and no row is added or deleted (stage 4). The
+   result counts the rows added to the table and those taken out of it, and says they weren't
+   written.
+16. **Locked: the header row and the key.** The header row holds the database's column names, and
+   the primary key's columns tell the database which row is which, so an edit that changes either
+   is refused, whichever command makes it (`cmd::data::db_write::check_locks`, beside sheet
+   protection in `commit`). Keys may move with their rows (a sort, a row deleted from the table)
+   and a row added to the table leaves its key empty. Columns may be added at the right end of the
+   table (they aren't the database's and aren't saved); a column inserted, deleted or moved inside
+   the table changes the header and is refused. Load, Refresh and Save themselves change both. A
+   table loaded from a view, or from a table without a primary key, can't be saved: its rows can't
+   be told apart once the table is sorted.
+17. **Validation from the type.** Loading gives each column other than the key a data validation
+   rule from its declared type, with a Stop message naming the column and its type: whole
+   numbers within the type's range (`smallint`, `integer`, `bigint`; SQLite's `INTEGER`), numbers
+   (`real`, `double precision`), numbers of at most so many digits before the point
+   (`numeric(p,s)`, `DECIMAL(p,s)`), TRUE or FALSE (a list), dates, times, and texts of at most so
+   many characters (`varchar(n)`); a column that is `NOT NULL` doesn't ignore a blank. A column
+   without a rule (`text`, `json`, `uuid`, an enum, an array, a BLOB) is checked by the database.
+   Refresh puts the rules again over the table's new rows.
+18. **Checked again when saving.** Validation only sees what is typed; a paste, a fill or a macro
+   passes it. So Save converts every changed value by its column's type, and if one doesn't fit
+   (empty in a `NOT NULL` column, text in a number column, too long, too many digits, a changed
+   BLOB) nothing is written and the message names the cells (`B2: customer is VARCHAR(40): at
+   most 40 characters`). Values go to the database as the type takes them: whole numbers as
+   integers, dates as `YYYY-MM-DD`, times as `HH:MM:SS`, booleans as 1 and 0; PostgreSQL casts
+   each from text to the column's type, and storing it checks the length and precision (a text
+   too long is refused, never cut).
+19. **One transaction, and nobody's changes lost.** The workbook keeps in memory (never in the
+   file) each row as the database had it when it was loaded (`DbSource::original`). Saving
+   compares the sheet with it to find the values changed; then, in one transaction, it reads
+   each of those rows again by its key (PostgreSQL: `FOR UPDATE`), and if a value it changes is
+   no longer what was loaded, or the row is gone, nothing is written and the message names the
+   sheet rows: Refresh shows the database's values (replacing the person's in those rows). A
+   value changed there in another column of the same row is no conflict. The rows saved are read
+   back, so the sheet shows what the database keeps (`numeric(12,2)` rounds 12.345 to 12.35), and
+   become the rows as loaded for the next save.
+20. **A table loaded before the workbook was opened.** Its rows as loaded aren't known, so the
+   changes can't be told from changes made in the database since. Save then asks first, and with
+   `overwrite` writes every value of the table that differs from the database now; Refresh, then
+   editing, saves safely.
+21. **Progress, Cancel, and no Undo.** Save runs in the background like Load: the busy box says
+   **Connecting…**, **Checking rows…** and **Saving rows…** with the count and the bar, and Cancel
+   stops it before anything is committed. What is in the database can't be taken back by Undo, so
+   a save clears Undo and Redo.
+
 ## Not yet
 
-- Writing back (stage 3).
+- Adding and deleting rows (stage 4).
 - Materialized views and foreign tables other than those `information_schema` lists.
 
 ## Testing against PostgreSQL
@@ -143,6 +195,7 @@ CREATE VIEW public.aktif AS SELECT nama FROM public.pelanggan WHERE aktif;
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-11-24 | minor | Stage 3: Save to Database writes the values changed in a loaded table back, in one transaction, rows found by their primary key and compared with the rows as loaded; the header row and key columns are locked; each column gets data validation from its type, and saving checks every changed value again; progress and Cancel; Undo cleared |
 | 2026-11-24 | minor | Connect and Table Information run in the background with a spinner, the step in words and Cancel in the pane; Load and Refresh say Connecting… and Counting rows… with a moving bar before the counted phases |
 | 2026-11-24 | minor | Stage 2: PostgreSQL in DB Connect (host, port, database, user, password, SSL); tables and views schema by schema, Table Information, Load and Refresh; read-only sessions over TLS with the system's certificate authorities; the password asked for each time and never kept |
 | 2026-11-24 | minor | Loading or refreshing a large table shows Reading rows… then Writing rows… with a progress bar and the count in the busy box; Cancel stops it in either phase and nothing changes |

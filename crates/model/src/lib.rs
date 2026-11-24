@@ -20,7 +20,7 @@ pub mod style;
 pub mod workbook;
 
 pub use cell::{Cell, CellPicture, Formula};
-pub use db::{DbColumn, DbEngine, DbRowKey, DbSource};
+pub use db::{DbCell, DbColumn, DbEngine, DbOriginal, DbRowKey, DbSource};
 pub use features::*;
 pub use links::{ExternalLink, LinkSheet, Links};
 pub use macros::*;

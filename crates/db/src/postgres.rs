@@ -10,7 +10,7 @@ use postgres::fallible_iterator::FallibleIterator;
 use postgres::types::ToSql;
 use postgres::{Client, Config};
 
-use crate::{ColumnInfo, DbError, DbValue, Limits, ObjectInfo, ObjectKind, PgConfig, RowKey, SslMode, Step, Stop, TableData};
+use crate::{ColumnInfo, DbError, DbValue, Limits, ObjectInfo, ObjectKind, PgConfig, RowChange, RowKey, SslMode, Step, Stop, TableData, WriteTarget};
 
 /// How long connecting may take.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -49,6 +49,11 @@ fn tls() -> Result<tokio_postgres_rustls::MakeRustlsConnect, DbError> {
 /// Connects, read-only: every transaction is read-only, statements stop at the time limit, and
 /// dates come as ISO text.
 fn connect(cfg: &PgConfig, timeout: Duration) -> Result<Client, DbError> {
+    connect_as(cfg, timeout, false)
+}
+
+/// Connects as [`connect`] does, but a session that writes when `writable`.
+fn connect_as(cfg: &PgConfig, timeout: Duration, writable: bool) -> Result<Client, DbError> {
     let mut c = Config::new();
     c.host(&cfg.host).port(cfg.port).dbname(&cfg.database).user(&cfg.user).connect_timeout(CONNECT_TIMEOUT).application_name("GridKu");
     if !cfg.password.is_empty() {
@@ -63,7 +68,8 @@ fn connect(cfg: &PgConfig, timeout: Duration) -> Result<Client, DbError> {
     let ms = timeout.as_millis().clamp(1, i32::MAX as u128);
     client
         .batch_execute(&format!(
-            "SET default_transaction_read_only = on; SET statement_timeout = {ms}; SET DateStyle = ISO, YMD; SET IntervalStyle = iso_8601"
+            "SET default_transaction_read_only = {}; SET statement_timeout = {ms}; SET DateStyle = ISO, YMD; SET IntervalStyle = iso_8601",
+            if writable { "off" } else { "on" }
         ))
         .map_err(|e| db_err(e, None))?;
     Ok(client)
@@ -262,6 +268,166 @@ pub(crate) fn read(
     Ok(TableData { columns: cols.into_iter().map(|c| c.info).collect(), rows: out, key, rowids: Vec::new(), truncated, cut_texts })
 }
 
+/// A value as text for a statement's `$n` (NULL as none). A BLOB, known only by its size, can't
+/// be written.
+fn param_text(v: &DbValue) -> Result<Option<String>, DbError> {
+    Ok(match v {
+        DbValue::Null => None,
+        DbValue::Integer(n) => Some(n.to_string()),
+        DbValue::Real(x) => Some(x.to_string()),
+        DbValue::Text(t) => Some(t.clone()),
+        DbValue::Blob(_) => return Err(DbError::Database("binary data (bytea) can't be written from a sheet".into())),
+    })
+}
+
+fn sql_params(v: &[Option<String>]) -> Vec<&(dyn ToSql + Sync)> {
+    v.iter().map(|x| x as &(dyn ToSql + Sync)).collect()
+}
+
+/// How often (in rows) a write reports its progress and asks whether to stop.
+const WRITE_REPORT_EVERY: usize = 200;
+
+pub(crate) fn write(
+    cfg: &PgConfig,
+    target: WriteTarget<'_>,
+    changes: &[RowChange],
+    limits: Limits,
+    stop: Option<Stop>,
+    progress: &mut dyn FnMut(Step),
+) -> Result<Vec<Vec<DbValue>>, DbError> {
+    use postgres::types::Type;
+    let (schema, table) = (target.schema.unwrap_or("public"), target.table);
+    let stopped = |s: &Option<Stop>| s.as_ref().is_some_and(|f| f());
+    let deadline = Instant::now() + limits.timeout;
+    let late = || Instant::now() > deadline;
+    progress(Step::Connecting);
+    let mut client = connect_as(cfg, limits.timeout, true)?;
+    if stopped(&stop) {
+        return Err(DbError::Cancelled);
+    }
+    let all = columns_of(&mut client, schema, table)?;
+    let cols = target
+        .columns
+        .iter()
+        .map(|n| {
+            all.iter().find(|c| c.info.name == *n).ok_or_else(|| DbError::Database(format!("the column \"{n}\" is no longer in {schema}.{table}")))
+        })
+        .collect::<Result<Vec<&Col>, _>>()?;
+    if cols.is_empty() || target.key.is_empty() {
+        return Err(DbError::Database("there is no primary key to find the rows by".into()));
+    }
+    // Each column's type without its modifier: a value is cast to it, and storing it in the
+    // column then checks the length and precision (and fails rather than cutting a text).
+    let typed = client
+        .query(
+            "SELECT attname::text, format_type(atttypid, NULL) FROM pg_attribute \
+             WHERE attrelid = (quote_ident($1) || '.' || quote_ident($2))::regclass AND attnum > 0 AND NOT attisdropped",
+            &[&schema, &table],
+        )
+        .map_err(|e| db_err(e, Some(&limits)))?;
+    let types: Vec<(String, String)> = typed.iter().filter_map(|r| Some((r.try_get(0).ok()?, r.try_get(1).ok()?))).collect();
+    let type_of = |name: &str| types.iter().find(|(n, _)| n == name).map(|(_, t)| t.clone()).unwrap_or_else(|| "text".into());
+    let key_cols = target
+        .key
+        .iter()
+        .map(|&k| cols.get(k).copied())
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| DbError::Database("the primary key is not among the columns".into()))?;
+    let by_key = |from: usize| {
+        key_cols
+            .iter()
+            .enumerate()
+            .map(|(i, c)| format!("{} = CAST(${} AS {})", quote(&c.info.name), from + i + 1, type_of(&c.info.name)))
+            .collect::<Vec<_>>()
+            .join(" AND ")
+    };
+    let from = qualified(schema, table);
+    let select = format!("SELECT {} FROM {from} WHERE {} FOR UPDATE", cols.iter().map(|c| select_expr(c)).collect::<Vec<_>>().join(", "), by_key(0));
+    let mut tx = client.transaction().map_err(|e| db_err(e, Some(&limits)))?;
+    let key_types = vec![Type::TEXT; key_cols.len()];
+    let st = tx.prepare_typed(&select, &key_types).map_err(|e| db_err(e, Some(&limits)))?;
+    let key_params = |ch: &RowChange| -> Result<Vec<Option<String>>, DbError> {
+        if ch.key.len() != key_cols.len() || ch.key.contains(&DbValue::Null) {
+            return Err(DbError::Database("a row's primary key is missing".into()));
+        }
+        ch.key.iter().map(param_text).collect()
+    };
+    let total = changes.len();
+    let mut cut_texts = 0usize;
+    let mut conflicts = Vec::new();
+    for (i, ch) in changes.iter().enumerate() {
+        if i.is_multiple_of(WRITE_REPORT_EVERY) {
+            if stopped(&stop) {
+                return Err(DbError::Cancelled);
+            }
+            if late() {
+                return Err(DbError::TimedOut(limits.timeout.as_secs()));
+            }
+            progress(Step::Checked { done: i, total });
+        }
+        let key = key_params(ch)?;
+        let same = match tx.query_opt(&st, &sql_params(&key)).map_err(|e| db_err(e, Some(&limits)))? {
+            None => false,
+            Some(row) => {
+                let mut same = true;
+                for (c, old, _) in &ch.set {
+                    let col = cols.get(*c).ok_or_else(|| DbError::Database("a column to set is not among the columns".into()))?;
+                    let text: Option<String> = row.try_get(*c).map_err(|e| db_err(e, Some(&limits)))?;
+                    same &= value(col, text, limits.max_text, &mut cut_texts) == *old;
+                }
+                same
+            }
+        };
+        if !same {
+            conflicts.push(i);
+        }
+    }
+    if !conflicts.is_empty() {
+        return Err(DbError::Conflict(conflicts));
+    }
+    progress(Step::Checked { done: total, total });
+    let mut out = Vec::with_capacity(total);
+    for (i, ch) in changes.iter().enumerate() {
+        if i.is_multiple_of(WRITE_REPORT_EVERY) {
+            if stopped(&stop) {
+                return Err(DbError::Cancelled);
+            }
+            if late() {
+                return Err(DbError::TimedOut(limits.timeout.as_secs()));
+            }
+            progress(Step::Written { done: i, total });
+        }
+        let mut sets = Vec::with_capacity(ch.set.len());
+        let mut params: Vec<Option<String>> = Vec::with_capacity(ch.set.len() + ch.key.len());
+        for (c, _, new) in &ch.set {
+            let col = cols.get(*c).ok_or_else(|| DbError::Database("a column to set is not among the columns".into()))?;
+            params.push(param_text(new)?);
+            sets.push(format!("{} = CAST(${} AS {})", quote(&col.info.name), params.len(), type_of(&col.info.name)));
+        }
+        if !sets.is_empty() {
+            let at = params.len();
+            params.extend(key_params(ch)?);
+            let sql = format!("UPDATE {from} SET {} WHERE {}", sets.join(", "), by_key(at));
+            let types = vec![Type::TEXT; params.len()];
+            let upd = tx.prepare_typed(&sql, &types).map_err(|e| db_err(e, Some(&limits)))?;
+            tx.execute(&upd, &sql_params(&params)).map_err(|e| db_err(e, Some(&limits)))?;
+        }
+        let row = tx.query_one(&st, &sql_params(&key_params(ch)?)).map_err(|e| db_err(e, Some(&limits)))?;
+        let mut values = Vec::with_capacity(cols.len());
+        for (c, col) in cols.iter().enumerate() {
+            let text: Option<String> = row.try_get(c).map_err(|e| db_err(e, Some(&limits)))?;
+            values.push(value(col, text, limits.max_text, &mut cut_texts));
+        }
+        out.push(values);
+    }
+    if stopped(&stop) {
+        return Err(DbError::Cancelled);
+    }
+    tx.commit().map_err(|e| db_err(e, Some(&limits)))?;
+    progress(Step::Written { done: total, total });
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -334,7 +500,13 @@ mod server_tests {
     #[test]
     fn lists_reads_and_never_writes() {
         let Some(cfg) = server() else { return };
-        let objs: Vec<(Option<String>, String, ObjectKind)> = objects(&cfg).unwrap().into_iter().map(|o| (o.schema, o.name, o.kind)).collect();
+        // Without the schemas the write test makes and drops meanwhile.
+        let objs: Vec<(Option<String>, String, ObjectKind)> = objects(&cfg)
+            .unwrap()
+            .into_iter()
+            .filter(|o| !o.schema.as_deref().is_some_and(|s| s.starts_with("uji_")))
+            .map(|o| (o.schema, o.name, o.kind))
+            .collect();
         assert_eq!(
             objs,
             [
@@ -382,5 +554,51 @@ mod server_tests {
         let wrong = PgConfig { password: "salah".into(), ..cfg };
         let e = objects(&wrong).unwrap_err().to_string();
         assert!(e.contains("password"), "{e}");
+    }
+
+    #[test]
+    fn writes_by_the_primary_key_checks_types_and_conflicts() {
+        let Some(cfg) = server() else { return };
+        // A table of its own, made and dropped here (the listing test sees only the script's).
+        let schema = format!("uji_{}", std::process::id());
+        let mut admin = connect_as(&cfg, Duration::from_secs(10), true).unwrap();
+        admin
+            .batch_execute(&format!(
+                "CREATE SCHEMA {schema}; CREATE TABLE {schema}.t (id integer PRIMARY KEY, nama varchar(5) NOT NULL, saldo numeric(6,2), lahir date, aktif boolean, at timestamptz); \
+                 INSERT INTO {schema}.t VALUES (1, 'Ana', 10.5, '2025-01-31', true, '2026-01-02 03:04:05'), (2, 'Budi', NULL, NULL, false, NULL);"
+            ))
+            .unwrap();
+        let cols: Vec<String> = ["id", "nama", "saldo", "lahir", "aktif", "at"].map(String::from).to_vec();
+        let target = WriteTarget { schema: Some(&schema), table: "t", columns: &cols, key: &[0] };
+        let original = read(&cfg, &schema, "t", Limits::default(), None, &mut |_| {}).unwrap();
+        let ana = original.rows[0].clone();
+        let run = |changes: &[RowChange]| write(&cfg, target, changes, Limits::default(), None, &mut |_| {});
+        // Values are cast to the column's type, and come back as the database stores them.
+        let ok = [RowChange {
+            key: vec![DbValue::Integer(1)],
+            set: vec![
+                (1, ana[1].clone(), DbValue::Text("Ani".into())),
+                (2, ana[2].clone(), DbValue::Real(12.345)),
+                (3, ana[3].clone(), DbValue::Text("2025-02-28".into())),
+                (4, ana[4].clone(), DbValue::Integer(0)),
+                (5, ana[5].clone(), DbValue::Text("2026-03-04 05:06:07".into())),
+            ],
+        }];
+        let back = run(&ok).unwrap();
+        assert_eq!(back[0][1], DbValue::Text("Ani".into()));
+        assert_eq!(back[0][2], DbValue::Real(12.35), "rounded to the column's scale");
+        assert_eq!(back[0][3], DbValue::Text("2025-02-28".into()));
+        assert_eq!(back[0][4], DbValue::Integer(0));
+        assert_eq!(back[0][5], DbValue::Text("2026-03-04 05:06:07".into()));
+        // The same change again: the row isn't as it was read any more.
+        assert!(matches!(run(&ok), Err(DbError::Conflict(rows)) if rows == [0]));
+        // Too long for varchar(5), and NOT NULL: the database says so and nothing is written.
+        let bad = |v: DbValue| [RowChange { key: vec![DbValue::Integer(2)], set: vec![(1, DbValue::Text("Budi".into()), v)] }];
+        let e = run(&bad(DbValue::Text("Bambang".into()))).unwrap_err().to_string();
+        assert!(e.contains("too long"), "{e}");
+        assert!(run(&bad(DbValue::Null)).is_err());
+        let now = read(&cfg, &schema, "t", Limits::default(), None, &mut |_| {}).unwrap();
+        assert_eq!(now.rows.iter().find(|r| r[0] == DbValue::Integer(2)).map(|r| r[1].clone()), Some(DbValue::Text("Budi".into())));
+        admin.batch_execute(&format!("DROP SCHEMA {schema} CASCADE")).unwrap();
     }
 }

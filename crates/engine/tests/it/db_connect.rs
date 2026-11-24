@@ -260,3 +260,168 @@ fn postgresql_tables_load_and_refresh_with_the_password_each_time() {
     let bytes = gridcraft_xlsx::write_xlsx(&s.doc().unwrap().wb).unwrap();
     assert!(!String::from_utf8_lossy(&zip_text(&bytes, "customXml/item1.xml").into_bytes()).contains(password));
 }
+
+/// The rows of `orders` in the database: (customer, total, paid).
+fn db_orders(db: &Db) -> Vec<(String, Option<f64>, Option<i64>)> {
+    let conn = rusqlite::Connection::open(&db.0).unwrap();
+    let mut st = conn.prepare("SELECT customer, total, paid FROM orders ORDER BY id").unwrap();
+    st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap().map(Result::unwrap).collect()
+}
+
+fn loaded(name: &str) -> (Db, Session) {
+    let db = Db::new(name, SHOP);
+    let mut s = Session::new();
+    s.new_workbook();
+    run(&mut s, "data.dbLoad", json!({"path": db.path(), "table": "orders"}));
+    (db, s)
+}
+
+#[test]
+fn changed_values_are_saved_back_and_read_back_and_undo_is_cleared() {
+    let (db, mut s) = loaded("dbsave");
+    run(&mut s, "cell.set", json!({"cell": "B2", "input": "Ani"}));
+    run(&mut s, "cell.set", json!({"cell": "C3", "input": "8.5"}));
+    run(&mut s, "cell.set", json!({"cell": "D3", "input": "TRUE"}));
+    let r = run(&mut s, "data.dbSave", json!({}));
+    assert_eq!((r["saved"].as_u64(), r["added"].as_u64(), r["removed"].as_u64()), (Some(2), Some(0), Some(0)));
+    assert_eq!(db_orders(&db), [("Ani".into(), Some(12.5), Some(1)), ("Budi".into(), Some(8.5), Some(1))]);
+    let d = s.doc().unwrap();
+    assert!(d.undo.is_empty() && d.redo.is_empty(), "saving to a database can't be undone");
+    // Nothing changed since: nothing to save. A change made after is compared with what was saved.
+    assert_eq!(run(&mut s, "data.dbSave", json!({}))["saved"], 0);
+    run(&mut s, "cell.set", json!({"cell": "B2", "input": "Ana"}));
+    assert_eq!(run(&mut s, "data.dbSave", json!({}))["saved"], 1);
+    assert_eq!(db_orders(&db)[0].0, "Ana");
+    // A row added to the table (its key left empty) is counted, not written.
+    let t = s.doc().unwrap().wb.sheet(1).unwrap().tables[0].name.clone();
+    run(&mut s, "table.resize", json!({"table": t, "range": "A1:H4"}));
+    run(&mut s, "cell.set", json!({"cell": "B4", "input": "Citra"}));
+    let r = run(&mut s, "data.dbSave", json!({}));
+    assert_eq!((r["saved"].as_u64(), r["added"].as_u64()), (Some(0), Some(1)));
+    assert_eq!(db_orders(&db).len(), 2);
+}
+
+#[test]
+fn the_header_row_and_key_columns_stay_as_loaded() {
+    let (db, mut s) = loaded("dblocks");
+    let refused = |s: &mut Session, id: &str, p: Json| {
+        let e = s.execute(id, p.clone()).expect_err(&format!("{id} {p}")).to_string();
+        assert!(e.contains("database"), "{e}");
+    };
+    refused(&mut s, "cell.set", json!({"cell": "B1", "input": "name"}));
+    refused(&mut s, "cell.set", json!({"cell": "A2", "input": "5"}));
+    refused(&mut s, "cell.set", json!({"cell": "A2", "input": "2"}));
+    // A row added to the table keeps its key empty.
+    let t = s.doc().unwrap().wb.sheet(1).unwrap().tables[0].name.clone();
+    run(&mut s, "table.resize", json!({"table": t, "range": "A1:H4"}));
+    refused(&mut s, "cell.set", json!({"cell": "A4", "input": "9"}));
+    run(&mut s, "cell.set", json!({"cell": "B4", "input": "Citra"}));
+    refused(&mut s, "edit.clearContents", json!({"range": "A2:A3"}));
+    assert_eq!((cell(&s, "orders", "B1"), cell(&s, "orders", "A2")), (Value::text("customer"), Value::Number(1.0)));
+    // Sorting moves each key with its row, and saving still finds the rows.
+    run(&mut s, "selection.set", json!({"range": "B2"}));
+    run(&mut s, "data.sortDescending", json!({}));
+    assert_eq!(
+        (cell(&s, "orders", "B2"), cell(&s, "orders", "A2"), cell(&s, "orders", "A3")),
+        (Value::text("Citra"), Value::Empty, Value::Number(2.0))
+    );
+    run(&mut s, "cell.set", json!({"cell": "B3", "input": "Budiman"}));
+    let r = run(&mut s, "data.dbSave", json!({}));
+    assert_eq!((r["saved"].as_u64(), r["added"].as_u64()), (Some(1), Some(1)));
+    assert_eq!(db_orders(&db)[1].0, "Budiman");
+    // Other cells of the sheet are free, and a table without the database's lock is untouched.
+    run(&mut s, "cell.set", json!({"cell": "K1", "input": "notes"}));
+}
+
+#[test]
+fn each_column_gets_validation_from_its_type_and_saving_checks_every_value() {
+    let (db, mut s) = loaded("dbcheck");
+    let ok = |s: &mut Session, a1: &str, input: &str| run(s, "data.validate", json!({"cell": a1, "input": input}))["ok"].as_bool();
+    assert_eq!(ok(&mut s, "B2", &"x".repeat(40)), Some(true));
+    assert_eq!(ok(&mut s, "B2", &"x".repeat(41)), Some(false), "VARCHAR(40)");
+    assert_eq!(ok(&mut s, "C2", "abc"), Some(false), "DECIMAL takes numbers");
+    assert_eq!(ok(&mut s, "C2", "99999999"), Some(true));
+    assert_eq!(ok(&mut s, "C2", "123456789"), Some(false), "DECIMAL(10,2): 8 digits before the point");
+    assert_eq!(ok(&mut s, "D2", "maybe"), Some(false), "BOOLEAN");
+    assert_eq!(ok(&mut s, "F2", "1.5"), Some(false), "INTEGER");
+    assert_eq!(ok(&mut s, "G2", "anything"), Some(true), "TEXT without a length");
+    // What validation doesn't see (a value set by a command, as a paste or a macro does) is
+    // caught when saving, and nothing is written.
+    run(&mut s, "cell.set", json!({"cell": "B2", "input": "x".repeat(41)}));
+    run(&mut s, "cell.set", json!({"cell": "B3", "input": ""}));
+    run(&mut s, "cell.set", json!({"cell": "C3", "input": "lots"}));
+    run(&mut s, "cell.set", json!({"cell": "D2", "input": "Ani"}));
+    let e = s.execute("data.dbSave", json!({})).unwrap_err().to_string();
+    assert!(e.contains("Nothing was saved: 4 values"), "{e}");
+    assert!(e.contains("B2: customer is VARCHAR(40): at most 40 characters"), "{e}");
+    assert!(e.contains("B3: customer can't be empty"), "{e}");
+    assert!(e.contains("C3: total is DECIMAL(10,2): it takes a number"), "{e}");
+    assert!(e.contains("D2: paid is BOOLEAN"), "{e}");
+    assert_eq!(db_orders(&db)[0].0, "Ana");
+    // A BLOB can't be changed from a sheet.
+    run(&mut s, "edit.undo", json!({}));
+    run(&mut s, "edit.undo", json!({}));
+    run(&mut s, "edit.undo", json!({}));
+    run(&mut s, "edit.undo", json!({}));
+    run(&mut s, "cell.set", json!({"cell": "H2", "input": "x"}));
+    assert!(s.execute("data.dbSave", json!({})).unwrap_err().to_string().contains("binary data"));
+}
+
+#[test]
+fn a_row_changed_in_the_database_since_it_was_loaded_stops_the_save() {
+    let (db, mut s) = loaded("dbconflict");
+    db.exec("UPDATE orders SET customer = 'Anna' WHERE id = 1;");
+    run(&mut s, "cell.set", json!({"cell": "B2", "input": "Ani"}));
+    run(&mut s, "cell.set", json!({"cell": "B3", "input": "Budiman"}));
+    let e = s.execute("data.dbSave", json!({})).unwrap_err().to_string();
+    assert!(e.contains("1 row was changed in the database") && e.contains("sheet row 2"), "{e}");
+    assert_eq!(db_orders(&db).iter().map(|r| r.0.as_str()).collect::<Vec<_>>(), ["Anna", "Budi"], "nothing written");
+    // Another column of the same row changed there is no conflict for this one.
+    run(&mut s, "cell.set", json!({"cell": "B2", "input": "Ana"}));
+    db.exec("UPDATE orders SET customer = 'Ana', note = 'x' WHERE id = 1;");
+    run(&mut s, "cell.set", json!({"cell": "C2", "input": "13"}));
+    assert_eq!(run(&mut s, "data.dbSave", json!({}))["saved"], 2);
+    assert_eq!(cell(&s, "orders", "G2"), Value::text("x"), "the row reads back as the database has it");
+}
+
+#[test]
+fn a_view_or_a_table_opened_from_a_file_saves_only_as_said() {
+    let db = Db::new("dbview", SHOP);
+    let mut s = Session::new();
+    s.new_workbook();
+    run(&mut s, "data.dbLoad", json!({"path": db.path(), "table": "paid_orders"}));
+    assert!(s.execute("data.dbSave", json!({})).unwrap_err().to_string().contains("no primary key"));
+    // Opened from a file, the rows as loaded aren't known: saving asks for `overwrite`.
+    let dir = std::env::temp_dir().join(format!("gridku-dbreopen-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let book = dir.join("b.xlsx").to_string_lossy().into_owned();
+    let mut s = Session::new();
+    s.new_workbook();
+    run(&mut s, "data.dbLoad", json!({"path": db.path(), "table": "orders"}));
+    run(&mut s, "file.saveAs", json!({"path": book}));
+    let mut again = Session::new();
+    run(&mut again, "file.open", json!({"path": book}));
+    run(&mut again, "sheet.activate", json!({"sheet": "orders"}));
+    run(&mut again, "cell.set", json!({"cell": "B3", "input": "Budiman"}));
+    assert!(again.execute("data.dbSave", json!({})).unwrap_err().to_string().contains("overwrite"));
+    assert_eq!(run(&mut again, "data.dbSave", json!({"overwrite": true}))["saved"], 1);
+    assert_eq!(db_orders(&db)[1].0, "Budiman");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn rows_and_columns_inserted_or_deleted_keep_the_rows_found() {
+    let (db, mut s) = loaded("dbshift");
+    // A column inserted before the table moves it; its header and keys go with it.
+    run(&mut s, "home.insertColumns", json!({"range": "A1"}));
+    assert_eq!(cell(&s, "orders", "C1"), Value::text("customer"));
+    // A row deleted is taken out of the table, not out of the database.
+    run(&mut s, "home.deleteRows", json!({"range": "A2"}));
+    run(&mut s, "cell.set", json!({"cell": "C2", "input": "Budiman"}));
+    let r = run(&mut s, "data.dbSave", json!({}));
+    assert_eq!((r["saved"].as_u64(), r["removed"].as_u64()), (Some(1), Some(1)));
+    assert_eq!(db_orders(&db).iter().map(|r| r.0.as_str()).collect::<Vec<_>>(), ["Ana", "Budiman"]);
+    // A column deleted from inside the table changes its header: refused.
+    assert!(s.execute("home.deleteColumns", json!({"range": "C1"})).is_err());
+}

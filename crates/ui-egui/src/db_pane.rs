@@ -6,8 +6,10 @@
 //! (`data.dbTables`), PostgreSQL's schema by schema; a click selects one, **Load** puts it in a
 //! new sheet as a table (`data.dbLoad`), and right-clicking one offers **Table Information…**, a
 //! window with each field's name, type and length (`data.dbColumns`). **Refresh** reads again the
-//! table at the active cell (`data.dbRefresh`). A large table loads in the background: the busy
-//! box shows the rows read, then written, as a progress bar, and Cancel stops it.
+//! table at the active cell (`data.dbRefresh`), and **Save to Database** writes the values changed
+//! in it back (`data.dbSave`). A large table loads and saves in the background: the busy box shows
+//! the rows read, then written (saving: checked, then saved), as a progress bar, and Cancel stops
+//! it.
 //!
 //! Connecting (reading the list) and Table Information run off the interface thread, so the window
 //! stays alive while a server answers (up to the 15-second connect limit): the pane shows what it
@@ -252,26 +254,54 @@ fn waiting_row(ui: &mut Ui, st: &mut PaneState) {
     ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
 }
 
-/// The sheet table at the active cell, when it was loaded from a database: its name, and the
-/// PostgreSQL connection it came from (`None` for SQLite).
-fn loaded_table_here(app: &SheetApp) -> Option<(String, Option<String>)> {
+/// The sheet table at the active cell, when it was loaded from a database.
+struct Here {
+    table: String,
+    /// The PostgreSQL connection it came from (`None` for SQLite).
+    pg: Option<String>,
+    /// The rows as loaded are known (loaded in this session): saving needs no `overwrite`.
+    known: bool,
+}
+
+fn loaded_table_here(app: &SheetApp) -> Option<Here> {
     let d = app.session.active()?;
     let sh = d.wb.active()?;
     let t = sh.table_at(d.selection.active)?;
     let src = d.wb.db_sources.iter().find(|s| s.table_id == t.id)?;
     let pg = (src.engine == gridcraft_engine::model::DbEngine::Postgres).then(|| src.location.clone());
-    Some((t.name.clone(), pg))
+    // A table without a primary key has no rows as loaded either; saving it says why it can't.
+    let keyed = matches!(src.key, gridcraft_engine::model::DbRowKey::Columns(_));
+    Some(Here { table: t.name.clone(), pg, known: src.original.0.is_some() || !keyed })
 }
 
-/// Runs Load or Refresh. A large table goes on in the background with a progress bar and Cancel
-/// (`background.rs`); what it did is said when it is over.
+/// Runs Load, Refresh or Save to Database. A large table goes on in the background with a
+/// progress bar and Cancel (`background.rs`); what it did is said when it is over.
 pub(crate) fn run_db(app: &mut SheetApp, id: &str, params: Json) {
-    match app.run_detached(id, params, crate::background::After::Report(loaded_message)) {
-        Some(Ok(r)) => app.toast = Some((loaded_message(&r), crate::now_ms())),
+    let said: fn(&Json) -> String = if id == "data.dbSave" { saved_message } else { loaded_message };
+    match app.run_detached(id, params, crate::background::After::Report(said)) {
+        Some(Ok(r)) => app.toast = Some((said(&r), crate::now_ms())),
         Some(Err(e)) if e == gridcraft_engine::EngineError::Cancelled.to_string() => {}
         Some(Err(e)) => app.message = Some(("DB Connect".into(), crate::clean_error(&e))),
         None => {}
     }
+}
+
+/// What a save did, in a line.
+pub(crate) fn saved_message(r: &Json) -> String {
+    let n = |k: &str| r[k].as_u64().unwrap_or(0);
+    let rows = |k: u64| if k == 1 { "row" } else { "rows" };
+    let table = r["table"].as_str().unwrap_or("");
+    let mut text = match n("saved") {
+        0 => format!("No changes to save in {table}"),
+        k => format!("Saved {k} {} of {table} to the database", rows(k)),
+    };
+    if n("added") > 0 {
+        text.push_str(&format!("; {} {} added to the table weren't saved (adding rows comes later)", n("added"), rows(n("added"))));
+    }
+    if n("removed") > 0 {
+        text.push_str(&format!("; {} {} taken out of the table weren't deleted", n("removed"), rows(n("removed"))));
+    }
+    text
 }
 
 /// What a load or refresh did, in a line.
@@ -473,17 +503,30 @@ fn tree_and_actions(app: &mut SheetApp, ui: &mut Ui, st: &mut PaneState, t: &Tok
             .add_enabled(idle && here.is_some(), egui::Button::new("Refresh"))
             .on_hover_text("Reads again the database table of the table at the active cell")
             .on_disabled_hover_text("Select a cell in a table loaded from a database");
-        if refresh.clicked()
-            && let Some((table, pg)) = here
-        {
-            match pg {
-                None => run_db(app, "data.dbRefresh", json!({"table": table})),
-                // Connected to that server now: its password; else it is asked for.
-                Some(url) if st.connected_url().as_deref() == Some(url.as_str()) => {
-                    let password = st.connected.as_ref().and_then(|c| c["password"].as_str()).unwrap_or("").to_string();
-                    run_db(app, "data.dbRefresh", json!({"table": table, "password": password}));
-                }
-                Some(url) => app.open_dialog("dbPassword", json!({"table": table, "url": url})),
+        let save = ui
+            .add_enabled(idle && here.is_some(), egui::Button::new("Save to Database"))
+            .on_hover_text("Writes the values changed in the table at the active cell back to its database table")
+            .on_disabled_hover_text("Select a cell in a table loaded from a database");
+        let Some(here) = here else { return };
+        // Connected to that server now: its password; else it is asked for.
+        let password = match &here.pg {
+            None => Some(String::new()),
+            Some(url) if st.connected_url().as_deref() == Some(url.as_str()) => {
+                Some(st.connected.as_ref().and_then(|c| c["password"].as_str()).unwrap_or("").to_string())
+            }
+            Some(_) => None,
+        };
+        if refresh.clicked() {
+            match (&password, &here.pg) {
+                (Some(pw), _) => run_db(app, "data.dbRefresh", json!({"table": here.table, "password": pw})),
+                (None, url) => app.open_dialog("dbPassword", json!({"table": here.table, "url": url})),
+            }
+        }
+        if save.clicked() {
+            match (&password, here.known) {
+                (Some(pw), true) => run_db(app, "data.dbSave", json!({"table": here.table, "password": pw})),
+                // Asked first: the password, or whether to overwrite (or both).
+                _ => app.open_dialog("dbSave", json!({"table": here.table, "url": here.pg, "password": password, "overwrite": !here.known})),
             }
         }
     });

@@ -24,10 +24,11 @@
 use std::sync::Arc;
 
 use gridcraft_core::{CellRef, RangeRef, Value};
-use gridcraft_db::{ColumnInfo, DbError, DbValue, Limits, PgConfig, RowKey, SslMode, Step, TableData};
-use gridcraft_model::{DbColumn, DbEngine, DbRowKey, DbSource};
+use gridcraft_db::{ColumnInfo, DbError, DbValue, Limits, PgConfig, RowChange, RowKey, SslMode, Step, TableData, WriteTarget};
+use gridcraft_model::{DbCell, DbColumn, DbEngine, DbOriginal, DbRowKey, DbSource, Table, Workbook};
 use serde_json::{Value as Json, json};
 
+use super::db_write::{db_cell, kind, rule};
 use crate::cmd::{CommandSpec, bad, cmd, edit, has_doc, str_param};
 use crate::progress::Phase;
 use crate::{EngineError, Result, Session};
@@ -69,6 +70,15 @@ pub(super) fn specs() -> Vec<CommandSpec> {
             "{table?: a sheet table's name, else the one at the active cell, password? (PostgreSQL: asked again, never kept)} → as data.dbLoad: reads its database table again",
             has_doc,
             refresh
+        ),
+        cmd!(
+            noundo "data.dbSave",
+            "Save to Database",
+            ["Data", "Get & Transform Data"],
+            None,
+            "{table?: a sheet table's name, else the one at the active cell, password? (PostgreSQL: asked again, never kept), overwrite?: bool} → {table, saved, added, removed}: writes the values changed in a table loaded from a database back to it, in one transaction, each row found by its primary key; nothing is written if a value doesn't fit its column or a row changed in the database since it was loaded. A table loaded before the workbook was opened needs `overwrite` (every value that differs from the database is written). Rows added or taken out of the table are counted, not written. Clears Undo",
+            has_doc,
+            super::db_write::save
         ),
     ]
 }
@@ -118,7 +128,7 @@ fn pg_param(p: &Json, id: &str) -> Result<PgConfig> {
 }
 
 /// A database to read: a SQLite file or a PostgreSQL connection.
-enum Conn {
+pub(super) enum Conn {
     Sqlite(String),
     Pg(PgConfig),
 }
@@ -132,7 +142,7 @@ impl Conn {
     }
 
     /// The database a loaded table came from; a PostgreSQL one takes `p.password`.
-    fn of_source(src: &DbSource, p: &Json, id: &str) -> Result<Conn> {
+    pub(super) fn of_source(src: &DbSource, p: &Json, id: &str) -> Result<Conn> {
         Ok(match src.engine {
             DbEngine::Sqlite => Conn::Sqlite(src.location.clone()),
             DbEngine::Postgres => {
@@ -181,7 +191,7 @@ impl Conn {
     }
 }
 
-fn db_err(e: DbError) -> EngineError {
+pub(super) fn db_err(e: DbError) -> EngineError {
     EngineError::Other(e.to_string())
 }
 
@@ -242,45 +252,49 @@ struct Grid {
 /// Largest integer a number holds exactly.
 const MAX_EXACT: i64 = 1 << 53;
 
-fn grid(data: &TableData, sys: gridcraft_core::DateSystem) -> Grid {
-    let upper: Vec<String> = data.columns.iter().map(|c| c.data_type.to_ascii_uppercase()).collect();
-    let mut formats: Vec<Option<&'static str>> = vec![None; data.columns.len()];
-    let mut rows = Vec::with_capacity(data.rows.len() + 1);
-    rows.push(data.columns.iter().map(|c| Value::text(c.name.as_str())).collect());
-    for row in &data.rows {
-        let mut out = Vec::with_capacity(row.len());
-        for (i, v) in row.iter().enumerate() {
-            let ty = upper.get(i).map(String::as_str).unwrap_or("");
-            out.push(match v {
-                DbValue::Null => Value::Empty,
-                DbValue::Integer(n) if ty.contains("BOOL") => Value::Bool(*n != 0),
-                DbValue::Integer(n) if n.unsigned_abs() <= MAX_EXACT.unsigned_abs() => Value::number(*n as f64),
-                DbValue::Integer(n) => Value::text(n.to_string()),
-                DbValue::Real(x) if x.is_finite() => Value::number(*x),
-                DbValue::Real(x) => Value::text(x.to_string()),
-                DbValue::Text(t) if ty.contains("DATE") || ty.contains("TIME") => {
-                    let typed = t.trim().trim_end_matches('Z').replacen('T', " ", 1);
-                    let parsed = gridcraft_core::parse::parse_input(&typed, sys);
-                    match (parsed.value, parsed.format) {
-                        (Value::Number(n), Some(f)) => {
-                            if let Some(slot) = formats.get_mut(i) {
-                                slot.get_or_insert(f);
-                            }
-                            Value::number(n)
-                        }
-                        _ => Value::text(t.as_str()),
-                    }
-                }
-                DbValue::Text(t) => Value::text(t.as_str()),
-                DbValue::Blob(n) => Value::text(format!("[BLOB {n} bytes]")),
-            });
+/// A database value as a cell shows it, in a column of declared type `ty` (upper case), with the
+/// number format a date takes.
+pub(super) fn shown(v: &DbCell, ty: &str, sys: gridcraft_core::DateSystem) -> (Value, Option<&'static str>) {
+    match v {
+        DbCell::Null => (Value::Empty, None),
+        DbCell::Integer(n) if ty.contains("BOOL") => (Value::Bool(*n != 0), None),
+        DbCell::Integer(n) if n.unsigned_abs() <= MAX_EXACT.unsigned_abs() => (Value::number(*n as f64), None),
+        DbCell::Integer(n) => (Value::text(n.to_string()), None),
+        DbCell::Real(x) if x.is_finite() => (Value::number(*x), None),
+        DbCell::Real(x) => (Value::text(x.to_string()), None),
+        DbCell::Text(t) if ty.contains("DATE") || ty.contains("TIME") => {
+            let typed = t.trim().trim_end_matches('Z').replacen('T', " ", 1);
+            let parsed = gridcraft_core::parse::parse_input(&typed, sys);
+            match (parsed.value, parsed.format) {
+                (Value::Number(n), Some(f)) => (Value::number(n), Some(f)),
+                _ => (Value::text(t.as_str()), None),
+            }
         }
-        rows.push(out);
+        DbCell::Text(t) => (Value::text(t.as_str()), None),
+        DbCell::Blob(n) => (Value::text(format!("[BLOB {n} bytes]")), None),
     }
-    Grid { rows, formats }
 }
 
-fn source(conn: &Conn, schema: Option<String>, table: &str, table_id: u32, data: &TableData) -> DbSource {
+fn grid(columns: &[ColumnInfo], rows: &[Vec<DbCell>], sys: gridcraft_core::DateSystem) -> Grid {
+    let upper: Vec<String> = columns.iter().map(|c| c.data_type.to_ascii_uppercase()).collect();
+    let mut formats: Vec<Option<&'static str>> = vec![None; columns.len()];
+    let mut out = Vec::with_capacity(rows.len() + 1);
+    out.push(columns.iter().map(|c| Value::text(c.name.as_str())).collect());
+    for row in rows {
+        let mut cells = Vec::with_capacity(row.len());
+        for (i, v) in row.iter().enumerate() {
+            let (value, format) = shown(v, upper.get(i).map(String::as_str).unwrap_or(""), sys);
+            if let (Some(f), Some(slot)) = (format, formats.get_mut(i)) {
+                slot.get_or_insert(f);
+            }
+            cells.push(value);
+        }
+        out.push(cells);
+    }
+    Grid { rows: out, formats }
+}
+
+fn source(conn: &Conn, schema: Option<String>, table: &str, table_id: u32, data: &TableData, rows: &Arc<Vec<Vec<DbCell>>>) -> DbSource {
     let columns = data
         .columns
         .iter()
@@ -297,12 +311,31 @@ fn source(conn: &Conn, schema: Option<String>, table: &str, table_id: u32, data:
         RowKey::Rowid => DbRowKey::Rowid(data.rowids.clone()),
         RowKey::None => DbRowKey::None,
     };
-    DbSource { engine: conn.engine(), location: conn.location(), schema, table: table.to_string(), table_id, columns, key }
+    // The rows as loaded, for saving changes back: only a table with a primary key can be saved.
+    let original = DbOriginal(matches!(key, DbRowKey::Columns(_)).then(|| rows.clone()));
+    DbSource { engine: conn.engine(), location: conn.location(), schema, table: table.to_string(), table_id, columns, key, original }
 }
 
 /// The sheet table with id `id`: its sheet, name and range.
-fn table_by_id(wb: &gridcraft_model::Workbook, id: u32) -> Option<(usize, String, RangeRef)> {
+pub(super) fn table_by_id(wb: &gridcraft_model::Workbook, id: u32) -> Option<(usize, String, RangeRef)> {
     wb.sheets.iter().enumerate().find_map(|(si, sh)| sh.tables.iter().find(|t| t.id == id).map(|t| (si, t.name.clone(), t.range)))
+}
+
+/// The sheet table with id `id`.
+pub(super) fn find_table(wb: &Workbook, id: u32) -> Option<&Table> {
+    wb.sheets.iter().find_map(|sh| sh.tables.iter().find(|t| t.id == id))
+}
+
+/// Runs `f` with the header row and key columns of database tables open to change (as loading,
+/// refreshing and saving change them); they are locked again afterwards, whatever `f` gives.
+pub(super) fn unlocked<R>(s: &mut Session, f: impl FnOnce(&mut Session) -> Result<R>) -> Result<R> {
+    let uid = s.doc()?.uid;
+    s.doc_mut()?.db_locks_off = true;
+    let r = f(s);
+    if let Some(d) = s.docs.iter_mut().find(|d| d.uid == uid) {
+        d.db_locks_off = false;
+    }
+    r
 }
 
 /// The range a table of `cols` columns and `rows` data rows takes from `start`: a header row and
@@ -359,16 +392,12 @@ fn write(s: &mut Session, si: usize, start: CellRef, g: &Grid, clear: Option<Ran
     Ok(())
 }
 
-fn read(s: &Session, conn: &Conn, schema: Option<&str>, table: &str) -> Result<TableData> {
+pub(super) fn read(s: &Session, conn: &Conn, schema: Option<&str>, table: &str) -> Result<TableData> {
     // Cancel (the busy box, Esc) stops the read; the rows read show as they come.
     let interrupt = s.interrupt();
     let stop: gridcraft_db::Stop = Arc::new(move || interrupt.is_requested());
     let progress = s.progress();
-    let mut report = |step: Step| match step {
-        Step::Connecting => progress.report(Phase::Connecting, 0, 0),
-        Step::Counting => progress.report(Phase::CountingRows, 0, 0),
-        Step::Rows { done, total } => progress.report(Phase::ReadingRows, done as u64, total as u64),
-    };
+    let mut report = |step: Step| report_step(&progress, step);
     let data = match conn {
         Conn::Sqlite(path) => gridcraft_db::sqlite_read(path, table, Limits::default(), Some(stop), &mut report),
         Conn::Pg(cfg) => gridcraft_db::pg_read(cfg, schema.unwrap_or("public"), table, Limits::default(), Some(stop), &mut report),
@@ -380,20 +409,79 @@ fn read(s: &Session, conn: &Conn, schema: Option<&str>, table: &str) -> Result<T
     })
 }
 
+/// Shows `step` as the command's progress.
+fn report_step(progress: &crate::progress::Progress, step: Step) {
+    match step {
+        Step::Connecting => progress.report(Phase::Connecting, 0, 0),
+        Step::Counting => progress.report(Phase::CountingRows, 0, 0),
+        Step::Rows { done, total } => progress.report(Phase::ReadingRows, done as u64, total as u64),
+        Step::Checked { done, total } => progress.report(Phase::CheckingRows, done as u64, total as u64),
+        Step::Written { done, total } => progress.report(Phase::SavingRows, done as u64, total as u64),
+    }
+}
+
+/// Writes `changes` to the database, with the progress shown and Cancel heard; the rows as they
+/// read back.
+pub(super) fn write_to_db(s: &Session, conn: &Conn, to: WriteTarget<'_>, changes: &[RowChange]) -> std::result::Result<Vec<Vec<DbValue>>, DbError> {
+    let interrupt = s.interrupt();
+    let stop: gridcraft_db::Stop = Arc::new(move || interrupt.is_requested());
+    let progress = s.progress();
+    let mut report = |step: Step| report_step(&progress, step);
+    let out = match conn {
+        Conn::Sqlite(path) => gridcraft_db::sqlite_write(path, to, changes, Limits::default(), Some(stop), &mut report),
+        Conn::Pg(cfg) => gridcraft_db::pg_write(cfg, to, changes, Limits::default(), Some(stop), &mut report),
+    };
+    s.progress().clear();
+    out
+}
+
 /// How often (in rows) writing reports its progress and asks whether to stop.
 const WRITE_REPORT_EVERY: usize = 5000;
 
-fn result(data: &TableData, sheet: &str, table: &str, range: RangeRef, refreshed: bool) -> Json {
+fn result(data: &TableData, rows: usize, sheet: &str, table: &str, range: RangeRef, refreshed: bool) -> Json {
     json!({
         "sheet": sheet,
         "table": table,
         "range": range.a1(),
-        "rows": data.rows.len(),
+        "rows": rows,
         "columns": data.columns.len(),
         "truncated": data.truncated,
         "cutTexts": data.cut_texts,
         "refreshed": refreshed,
     })
+}
+
+/// The rows read, taken out of `data`, as the workbook keeps them.
+fn take_rows(data: &mut TableData) -> Arc<Vec<Vec<DbCell>>> {
+    Arc::new(std::mem::take(&mut data.rows).into_iter().map(|row| row.into_iter().map(db_cell).collect()).collect())
+}
+
+/// Gives each column of the table at `range` on sheet `si` the data validation its type takes
+/// (`db_write::rule`), after taking off those of `old` (the table's data rows before a refresh).
+fn validate_columns(s: &mut Session, si: usize, engine: DbEngine, columns: &[ColumnInfo], range: RangeRef, old: Option<RangeRef>) -> Result<()> {
+    if let Some(old) = old.filter(|o| o.start.row <= o.end.row) {
+        s.execute("data.validation", json!({"sheet": si, "range": old.a1(), "clear": true}))?;
+    }
+    let first = range.start.row + 1;
+    if first > range.end.row {
+        return Ok(());
+    }
+    for (i, c) in columns.iter().enumerate().filter(|(_, c)| c.primary_key == 0) {
+        let col = DbColumn {
+            name: c.name.clone(),
+            data_type: c.data_type.clone(),
+            length: c.length.clone(),
+            nullable: c.nullable,
+            primary_key: c.primary_key,
+        };
+        let Some(mut p) = rule(&col, kind(&col, engine)) else { continue };
+        let at = range.start.col + i as u32;
+        let r = RangeRef::new(CellRef::new(first, at), CellRef::new(range.end.row, at));
+        p["sheet"] = json!(si);
+        p["range"] = json!(r.a1());
+        s.execute("data.validation", p)?;
+    }
+    Ok(())
 }
 
 fn load(s: &mut Session, p: &Json) -> Result<Json> {
@@ -410,45 +498,51 @@ fn load(s: &mut Session, p: &Json) -> Result<Json> {
     if let Some(id) = before.map(|src| src.table_id) {
         return refresh_table(s, id, &conn, ID);
     }
-    let data = read(s, &conn, schema.as_deref(), &table)?;
+    let mut data = read(s, &conn, schema.as_deref(), &table)?;
     if data.columns.is_empty() {
         return Err(bad(ID, format!("\"{table}\" has no columns to load")));
     }
+    let rows = take_rows(&mut data);
     let sys = s.doc()?.wb.date_system;
-    let g = grid(&data, sys);
-    s.grouped("Load from Database", |s| {
-        // A table of another schema than `public` is named with it (`gudang.stok`).
-        let shown = match schema.as_deref() {
-            Some(sch) if sch != "public" => format!("{sch}.{table}"),
-            _ => table.clone(),
-        };
-        let name = sheet_name(&s.doc()?.wb, &shown);
-        let count = s.doc()?.wb.sheets.len();
-        s.execute("home.insertSheet", json!({"name": name, "before": count}))?;
-        let si = s.doc()?.wb.sheet_index(&name).ok_or_else(|| bad(ID, "the new sheet is gone"))?;
-        let range = range_for(CellRef::new(0, 0), data.rows.len(), data.columns.len(), ID)?;
-        write(s, si, range.start, &g, None)?;
-        let made = s.execute("insert.table", json!({"sheet": si, "range": range.a1(), "header": true}))?;
-        // Columns as wide as their contents, so dates and long texts show (a refresh keeps the
-        // widths the person set).
-        let cols = format!("{}:{}", gridcraft_core::col_to_letters(range.start.col), gridcraft_core::col_to_letters(range.end.col));
-        s.execute("home.autofitColumnWidth", json!({"sheet": si, "cols": cols}))?;
-        let tname = made.get("table").and_then(Json::as_str).unwrap_or_default().to_string();
-        let wb = &s.doc()?.wb;
-        let id = wb.sheet(si).and_then(|sh| sh.tables.iter().find(|t| t.name == tname)).map(|t| t.id).ok_or_else(|| bad(ID, "the table is gone"))?;
-        let src = Arc::new(source(&conn, schema.clone(), &table, id, &data));
-        edit(s, |cx| {
-            cx.wb.db_sources.retain(|o| o.table_id != id);
-            cx.wb.db_sources.push(src);
-            Ok(())
-        })?;
-        s.execute("selection.set", json!({"sheet": si, "range": "A1"}))?;
-        Ok(result(&data, &name, &tname, range, false))
+    let g = grid(&data.columns, &rows, sys);
+    unlocked(s, |s| {
+        s.grouped("Load from Database", |s| {
+            // A table of another schema than `public` is named with it (`gudang.stok`).
+            let shown = match schema.as_deref() {
+                Some(sch) if sch != "public" => format!("{sch}.{table}"),
+                _ => table.clone(),
+            };
+            let name = sheet_name(&s.doc()?.wb, &shown);
+            let count = s.doc()?.wb.sheets.len();
+            s.execute("home.insertSheet", json!({"name": name, "before": count}))?;
+            let si = s.doc()?.wb.sheet_index(&name).ok_or_else(|| bad(ID, "the new sheet is gone"))?;
+            let range = range_for(CellRef::new(0, 0), rows.len(), data.columns.len(), ID)?;
+            write(s, si, range.start, &g, None)?;
+            let made = s.execute("insert.table", json!({"sheet": si, "range": range.a1(), "header": true}))?;
+            validate_columns(s, si, engine, &data.columns, range, None)?;
+            // Columns as wide as their contents, so dates and long texts show (a refresh keeps the
+            // widths the person set).
+            let cols = format!("{}:{}", gridcraft_core::col_to_letters(range.start.col), gridcraft_core::col_to_letters(range.end.col));
+            s.execute("home.autofitColumnWidth", json!({"sheet": si, "cols": cols}))?;
+            let tname = made.get("table").and_then(Json::as_str).unwrap_or_default().to_string();
+            let wb = &s.doc()?.wb;
+            let id =
+                wb.sheet(si).and_then(|sh| sh.tables.iter().find(|t| t.name == tname)).map(|t| t.id).ok_or_else(|| bad(ID, "the table is gone"))?;
+            let src = Arc::new(source(&conn, schema.clone(), &table, id, &data, &rows));
+            edit(s, |cx| {
+                cx.wb.db_sources.retain(|o| o.table_id != id);
+                cx.wb.db_sources.push(src);
+                Ok(())
+            })?;
+            s.execute("selection.set", json!({"sheet": si, "range": "A1"}))?;
+            Ok(result(&data, rows.len(), &name, &tname, range, false))
+        })
     })
 }
 
-fn refresh(s: &mut Session, p: &Json) -> Result<Json> {
-    const ID: &str = "data.dbRefresh";
+/// The sheet table `p.table` names, else the one at the active cell (or the only one on the
+/// sheet) loaded from a database, with its source.
+pub(super) fn target(s: &Session, p: &Json, id: &str) -> Result<(u32, Arc<DbSource>)> {
     let d = s.doc()?;
     let wb = &d.wb;
     let si = wb.active_sheet();
@@ -461,8 +555,14 @@ fn refresh(s: &mut Session, p: &Json) -> Result<Json> {
             if mine.len() == 1 { mine.first().copied() } else { None }
         }),
     };
-    let id = t.map(|t| t.id).ok_or_else(|| bad(ID, "select a cell in a table loaded from a database"))?;
-    let src = wb.db_sources.iter().find(|src| src.table_id == id).cloned().ok_or_else(|| bad(ID, "this table wasn't loaded from a database"))?;
+    let tid = t.map(|t| t.id).ok_or_else(|| bad(id, "select a cell in a table loaded from a database"))?;
+    let src = wb.db_sources.iter().find(|src| src.table_id == tid).cloned().ok_or_else(|| bad(id, "this table wasn't loaded from a database"))?;
+    Ok((tid, src))
+}
+
+fn refresh(s: &mut Session, p: &Json) -> Result<Json> {
+    const ID: &str = "data.dbRefresh";
+    let (id, src) = target(s, p, ID)?;
     let conn = Conn::of_source(&src, p, ID)?;
     refresh_table(s, id, &conn, ID)
 }
@@ -472,11 +572,14 @@ fn refresh_table(s: &mut Session, id: u32, conn: &Conn, cmd: &str) -> Result<Jso
     let wb = &s.doc()?.wb;
     let src = wb.db_sources.iter().find(|src| src.table_id == id).cloned().ok_or_else(|| bad(cmd, "this table wasn't loaded from a database"))?;
     let (si, tname, old) = table_by_id(wb, id).ok_or_else(|| bad(cmd, "the table loaded from the database is gone"))?;
-    let data = read(s, conn, src.schema.as_deref(), &src.table)?;
+    let old_data = find_table(wb, id).and_then(Table::data_range);
+    let mut data = read(s, conn, src.schema.as_deref(), &src.table)?;
     if data.columns.is_empty() {
         return Err(bad(cmd, format!("\"{}\" has no columns to load", src.table)));
     }
-    let new = range_for(old.start, data.rows.len(), data.columns.len(), cmd)?;
+    let rows = take_rows(&mut data);
+    let wb = &s.doc()?.wb;
+    let new = range_for(old.start, rows.len(), data.columns.len(), cmd)?;
     // Growing: the cells it grows into must be empty and in no other table.
     let sh = wb.sheet(si).ok_or(EngineError::NoDocument)?;
     let taken = sh.cells.iter_range(new).any(|(c, cell)| !old.contains(c) && cell.has_content());
@@ -488,22 +591,25 @@ fn refresh_table(s: &mut Session, id: u32, conn: &Conn, cmd: &str) -> Result<Jso
         )));
     }
     let sheet = sh.name.clone();
-    let g = grid(&data, wb.date_system);
-    s.grouped("Refresh", |s| {
-        if s.doc()?.wb.active_sheet() != si {
-            s.execute("sheet.activate", json!({"sheet": si}))?;
-        }
-        write(s, si, new.start, &g, Some(old))?;
-        if new != old {
-            s.execute("table.resize", json!({"table": tname, "range": new.a1()}))?;
-        }
-        let fresh = Arc::new(source(conn, src.schema.clone(), &src.table, id, &data));
-        edit(s, |cx| {
-            for o in cx.wb.db_sources.iter_mut().filter(|o| o.table_id == id) {
-                *o = fresh.clone();
+    let g = grid(&data.columns, &rows, wb.date_system);
+    unlocked(s, |s| {
+        s.grouped("Refresh", |s| {
+            if s.doc()?.wb.active_sheet() != si {
+                s.execute("sheet.activate", json!({"sheet": si}))?;
             }
-            Ok(())
-        })?;
-        Ok(result(&data, &sheet, &tname, new, true))
+            write(s, si, new.start, &g, Some(old))?;
+            if new != old {
+                s.execute("table.resize", json!({"table": tname, "range": new.a1()}))?;
+            }
+            validate_columns(s, si, src.engine, &data.columns, new, old_data)?;
+            let fresh = Arc::new(source(conn, src.schema.clone(), &src.table, id, &data, &rows));
+            edit(s, |cx| {
+                for o in cx.wb.db_sources.iter_mut().filter(|o| o.table_id == id) {
+                    *o = fresh.clone();
+                }
+                Ok(())
+            })?;
+            Ok(result(&data, rows.len(), &sheet, &tname, new, true))
+        })
     })
 }

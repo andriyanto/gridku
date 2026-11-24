@@ -941,6 +941,7 @@ impl Dialog {
                     json!({"table": p("table")}),
                 )
             }
+            "dbSave" => db_save_dialog(&params),
             "exportPdf" => {
                 // Excel's Options… of Export › Create PDF: what to publish, and (ours) the whole
                 // workbook as one PDF or one PDF per sheet.
@@ -1108,6 +1109,32 @@ impl Dialog {
         ref_edit::record_home(app, &mut d);
         Some(d)
     }
+}
+
+/// Save to Database, asked first: the PostgreSQL password when the pane isn't connected to the
+/// table's server (asked again, never kept), and, for a table loaded before the workbook was
+/// opened, whether to write every value that differs from the database.
+fn db_save_dialog(params: &Json) -> Dialog {
+    use Field::*;
+    let mut fields = Vec::new();
+    if params["overwrite"].as_bool() == Some(true) {
+        fields.push(Note(
+            "This table was loaded before the workbook was opened, so GridKu can't tell which values were changed in the database since. \
+             Saving writes every value of the table that differs from the database now. To save only your changes safely, Cancel and Refresh first."
+                .into(),
+        ));
+    }
+    let mut seed = json!({"table": params["table"], "overwrite": params["overwrite"]});
+    match params["password"].as_str() {
+        Some(pw) => seed["password"] = json!(pw),
+        None => {
+            let url = params["url"].as_str().unwrap_or("").to_string();
+            let server = gridcraft_db::PgConfig::from_url(&url).map_or(url, |c| format!("{}@{}:{}/{}", c.user, c.host, c.port, c.database));
+            fields.push(Note(format!("The password of {server}, to save the table")));
+            fields.push(Password { key: "password", label: "Password:" });
+        }
+    }
+    Dialog::form("dbSave", "Save to Database", "data.dbSave", fields, seed)
 }
 
 /// Conditional Formatting's quick dialogs (Greater Than…, Top 10 Items…, Duplicate Values…, New

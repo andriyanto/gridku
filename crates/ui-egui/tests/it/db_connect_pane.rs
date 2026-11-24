@@ -79,3 +79,57 @@ fn a_file_that_is_not_a_database_says_so_and_the_pane_stays_usable() {
     assert!(h.query_by_label("Connect").is_some());
     let _ = std::fs::remove_file(&path);
 }
+
+fn customer(db: &std::path::Path) -> String {
+    rusqlite::Connection::open(db).unwrap().query_row("SELECT customer FROM orders WHERE id = 1", [], |r| r.get(0)).unwrap()
+}
+
+#[test]
+fn save_to_database_writes_the_changed_values_back() {
+    let db = database("save");
+    let mut h = crate::support::blank_harness(4);
+    h.state_mut().grid.pane = Some("dbConnect".into());
+    h.run_steps(2);
+    h.get_by_label("Database file").focus();
+    h.run_steps(1);
+    h.get_by_label("Database file").type_text(&db.to_string_lossy());
+    h.run_steps(1);
+    h.get_by_label("Connect").click();
+    assert!(until_shown(&mut h, "orders"));
+    h.get_by_label("orders").click();
+    h.run_steps(1);
+    h.get_all_by_label("Load").next().unwrap().click();
+    h.run_steps(3);
+    h.state_mut().run("cell.set", serde_json::json!({"cell": "B2", "input": "Ani"})).unwrap();
+    h.state_mut().run("selection.set", serde_json::json!({"range": "B2"})).unwrap();
+    h.run_steps(2);
+    h.get_by_label("Save to Database").click();
+    let mut saved = false;
+    for _ in 0..500 {
+        h.run_steps(1);
+        if customer(&db) == "Ani" {
+            saved = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert!(saved, "the database has the new value");
+    // The header row stays: typing over it is refused.
+    assert!(h.state_mut().run("cell.set", serde_json::json!({"cell": "B1", "input": "name"})).is_err());
+    let wb = &h.state().session.active().unwrap().wb;
+    assert_eq!(wb.active().unwrap().value(gridcraft_engine::core::CellRef::new(0, 1)).display(), "customer");
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn save_asks_for_the_password_or_to_overwrite_when_it_must() {
+    let mut h = crate::support::blank_harness(4);
+    h.state_mut().open_dialog(
+        "dbSave",
+        serde_json::json!({"table": "Table1", "url": "postgresql://andri@db.lan:5432/toko?sslmode=prefer", "password": null, "overwrite": true}),
+    );
+    h.run_steps(2);
+    assert!(h.query_all_by_label_contains("loaded before the workbook was opened").next().is_some());
+    assert!(h.query_all_by_label_contains("The password of andri@db.lan:5432/toko").next().is_some());
+    assert!(h.query_by_label("Password:").is_some());
+}

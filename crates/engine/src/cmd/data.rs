@@ -18,6 +18,7 @@ use crate::outline;
 use crate::selection::current_region;
 
 mod db;
+mod db_write;
 mod filter;
 mod grouping;
 mod links;
@@ -25,6 +26,7 @@ mod sort;
 mod tools;
 mod validation;
 
+pub(crate) use db_write::check_locks as db_locks;
 pub use filter::filter_values;
 pub(crate) use filter::{apply_filter, grow_autofilter};
 use filter::{clear_filter, filter_by, reapply, toggle_filter};
